@@ -9,6 +9,8 @@ import torch
 from aeropipe_rl.config import (
     ACT_DIM,
     BEST_CKPT_PATH,
+    CURRICULUM_ENABLED,
+    CURRICULUM_RAMP_EP,
     DEVICE,
     EGO_DIM,
     GLOBAL_DIM,
@@ -18,6 +20,8 @@ from aeropipe_rl.config import (
     LATEST_CKPT_PATH,
     MAX_TRAIN_EPISODES,
     N_AGENTS,
+    N_AGENTS_START,
+    N_AGENTS_TARGET,
     NBR_DIM,
     N_HEADS,
     N_LAYERS,
@@ -41,15 +45,28 @@ def seed_all(seed: int) -> None:
 
 def print_banner() -> None:
     print(f"[AeroPipeRL] seed={GLOBAL_SEED}")
-    print(f"[AeroPipeRL] device={DEVICE} N_AGENTS={N_AGENTS}")
+    print(f"[AeroPipeRL] device={DEVICE} N_AGENTS={N_AGENTS} (curriculum: {N_AGENTS_START}->{N_AGENTS_TARGET})")
     print(f"[AeroPipeRL] EGO={EGO_DIM} NBR={NBR_DIM} ACT={ACT_DIM} HIDDEN={HIDDEN} heads={N_HEADS} layers={N_LAYERS}")
     print(f"[AeroPipeRL] GLOBAL_DIM={GLOBAL_DIM} SAVE_EVERY_EP={SAVE_EVERY_EP}")
 
 
+def get_curriculum_n_agents(ep: int) -> int:
+    """
+    INNOVATION: Agent-count curriculum.
+    Start with 2 agents, linearly ramp to N_AGENTS_TARGET over CURRICULUM_RAMP_EP episodes.
+    This lets the policy learn basic navigation before facing full multi-agent coordination.
+    """
+    if not CURRICULUM_ENABLED:
+        return N_AGENTS_TARGET
+    frac = min(1.0, ep / max(CURRICULUM_RAMP_EP, 1))
+    n = int(N_AGENTS_START + frac * (N_AGENTS_TARGET - N_AGENTS_START))
+    return max(N_AGENTS_START, min(N_AGENTS_TARGET, n))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train AeroPipeRL with headless MAPPO.")
-    parser.add_argument("--resume", choices=["none", "latest", "best"], default="latest", help="Resume training from checkpoint.")
-    parser.add_argument("--max-episodes", type=int, default=MAX_TRAIN_EPISODES, help="Maximum number of training episodes to run.")
+    parser.add_argument("--resume", choices=["none", "latest", "best"], default="latest")
+    parser.add_argument("--max-episodes", type=int, default=MAX_TRAIN_EPISODES)
     args = parser.parse_args(argv)
 
     ensure_runtime_dirs()
@@ -57,7 +74,9 @@ def main(argv: list[str] | None = None) -> None:
     print_banner()
 
     net = PipeNet()
-    env = MAEnv(net)
+    # Start with N_AGENTS_START agents for curriculum
+    init_n = get_curriculum_n_agents(0)
+    env = MAEnv(net, n_agents=init_n)
     trainer = MAPPOTrainer()
 
     if args.resume == "latest":
@@ -68,14 +87,23 @@ def main(argv: list[str] | None = None) -> None:
         print("[AeroPipeRL] Resume disabled, starting from scratch.")
 
     print(f"[AeroPipeRL] Network: {len(net.nodes)} nodes, {len(net.edges)} edges")
+    print(f"[AeroPipeRL] Starting with {init_n} agents (curriculum)")
 
     def new_episode():
+        # INNOVATION: update agent count per curriculum schedule
+        target_n = get_curriculum_n_agents(trainer.ep)
+        if env.n_agents != target_n:
+            prev_n = env.n_agents
+            env.set_n_agents(target_n)
+            trainer.set_n_agents(target_n)
+            print(f"[AeroPipeRL] Curriculum: agents {prev_n}->{target_n} at ep {trainer.ep}")
         obs = env.reset()
         trainer.reset_episode()
         return obs, 0.0, 0
 
     def on_episode_end(ep_reward, results, ep_steps):
         nonlocal tr_obs, tr_ep_r, tr_ep_steps
+        n = env.n_agents
         trainer.end_ep(ep_reward, results, ep_steps, env.done_steps.copy(), env.step_budget)
 
         wall_rate_ep = float(np.mean(env.ep_wall_hit.astype(np.float32)))
@@ -128,17 +156,16 @@ def main(argv: list[str] | None = None) -> None:
             time_pen100 = float(np.mean(trainer.time_gauss_pen100)) if trainer.time_gauss_pen100 else 0.0
 
             print(
-                f"[EP {trainer.ep:6d}] R={ep_reward:8.2f} | goal={goal_cnt:2d}/{N_AGENTS:2d} timeout={timeout_cnt:2d} "
-                f"| steps={ep_steps:4d}/{env.step_budget:4d} | ETA(avg/med/std)={eta_avg:6.1f}/{eta_med:6.1f}/{eta_std:6.1f}"
+                f"[EP {trainer.ep:6d}|n={n}] R={ep_reward:7.3f} | goal={goal_cnt:2d}/{n:2d} timeout={timeout_cnt:2d} "
+                f"| steps={ep_steps:4d}/{env.step_budget:4d} | ETA(avg/med/std)={eta_avg:6.1f}/{eta_med:6.1f}/{eta_std:5.1f}"
             )
             print(
-                f"           100ep: SR={sr100:6.2f}% R={r100:8.2f} steps={step100:6.1f} "
-                f"wall={wall100:6.2f}% aCol={aco100:6.2f}% to20/50/100={to20_100:5.1f}/{to50_100:5.1f}/{to100_100:5.1f}% "
-                f"colMA={col_ma100:6.2f}% timePen(cur/100)={time_pen_cur:7.3f}/{time_pen100:7.3f}"
+                f"           100ep: SR={sr100:6.2f}% R={r100:7.3f} steps={step100:6.1f} "
+                f"wall={wall100:5.2f}% aCol={aco100:5.2f}% to20/50/100={to20_100:5.1f}/{to50_100:5.1f}/{to100_100:5.1f}%"
             )
             print(
-                f"           train: spd_alive={speed_avg:5.2f} loss20={loss20:8.4f} "
-                f"lr(a/p/c)={lr_a:.2e}/{lr_p:.2e}/{lr_c:.2e} upd={trainer.update_cnt:6d} buf={len(trainer.buf):4d} best={trainer.best_score:8.2f}"
+                f"           train: spd={speed_avg:4.2f} loss20={loss20:7.4f} "
+                f"lr(a/p/c)={lr_a:.2e}/{lr_p:.2e}/{lr_c:.2e} upd={trainer.update_cnt:5d} best={trainer.best_score:7.3f}"
             )
 
         tr_obs, tr_ep_r, tr_ep_steps = new_episode()
@@ -146,9 +173,11 @@ def main(argv: list[str] | None = None) -> None:
     tr_obs, tr_ep_r, tr_ep_steps = new_episode()
 
     while True:
+        n = env.n_agents
         egos, node_feats, adjs, nbrs, nbr_masks, global_obs = tr_obs
         dones_before = env.dones.copy()
         ep_start = tr_ep_steps == 0
+
         step_out = trainer.act(
             egos,
             node_feats,
@@ -168,7 +197,7 @@ def main(argv: list[str] | None = None) -> None:
 
         option_end = np.logical_or(step_out["termination_actions"], dones)
 
-        clean_global = trainer._critic_global_from_egos(egos, dones_mask=dones_before)
+        clean_global = trainer._critic_global_from_egos(egos, dones_mask=dones_before, n_agents=n)
         trainer.buf.push(
             np.stack(egos),
             np.stack(node_feats),
@@ -216,7 +245,7 @@ def main(argv: list[str] | None = None) -> None:
 
         if len(trainer.buf) >= T_HORIZON:
             next_egos, _, _, _, _, _ = tr_obs
-            trainer.update(next_egos, env.dones)
+            trainer.update(next_egos, env.dones, n_agents=n)
 
 
 if __name__ == "__main__":

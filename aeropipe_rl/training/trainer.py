@@ -15,6 +15,8 @@ from aeropipe_rl.config import (
     DEVICE,
     ENABLE_COMM,
     ENT_COEF,
+    ENT_COEF_MIN,
+    ENT_COEF_DECAY,
     EGO_DIM,
     GRAD_NORM,
     HIDDEN,
@@ -48,6 +50,8 @@ class MAPPOTrainer:
         self.ep = 0
         self.total_t = 0
         self.update_cnt = 0
+        self._cur_n_agents = N_AGENTS   # tracks curriculum agent count
+
         self.r_hist = deque(maxlen=500)
         self.loss_hist = deque(maxlen=500)
         self.sr_hist = deque(maxlen=50)
@@ -73,6 +77,15 @@ class MAPPOTrainer:
         self.has_active_option = np.zeros(N_AGENTS, dtype=bool)
         self.pending_replan = np.ones(N_AGENTS, dtype=bool)
 
+    def set_n_agents(self, n: int) -> None:
+        """Curriculum: update active agent count. Resets per-agent state."""
+        self._cur_n_agents = n
+        self.active_subgoal_pos = np.zeros((N_AGENTS, 3), dtype=np.float32)
+        self.active_subgoal_token = np.zeros((N_AGENTS, HIDDEN), dtype=np.float32)
+        self.active_subgoal_node = np.zeros(N_AGENTS, dtype=np.int64)
+        self.has_active_option = np.zeros(N_AGENTS, dtype=bool)
+        self.pending_replan = np.ones(N_AGENTS, dtype=bool)
+
     def reset_episode(self) -> None:
         self.policy.executor.reset_temporal()
         self.active_subgoal_pos.fill(0.0)
@@ -83,20 +96,24 @@ class MAPPOTrainer:
 
     def after_step(self, dones: np.ndarray) -> None:
         done_mask = np.asarray(dones, dtype=bool)
-        self.pending_replan[done_mask] = False
-        self.has_active_option[done_mask] = False
-        self.active_subgoal_pos[done_mask] = 0.0
-        self.active_subgoal_token[done_mask] = 0.0
-        self.active_subgoal_node[done_mask] = 0
+        n = len(done_mask)
+        self.pending_replan[:n][done_mask] = False
+        self.has_active_option[:n][done_mask] = False
+        self.active_subgoal_pos[:n][done_mask] = 0.0
+        self.active_subgoal_token[:n][done_mask] = 0.0
+        self.active_subgoal_node[:n][done_mask] = 0
 
-    def _critic_global_from_egos(self, egos, dones_mask=None):
-        global_obs = np.concatenate(egos).astype(np.float32)
-        if dones_mask is not None:
-            global_obs = global_obs.copy()
-            for i in range(N_AGENTS):
-                if dones_mask[i]:
-                    start = i * EGO_DIM
-                    global_obs[start : start + EGO_DIM] = 0.0
+    def _critic_global_from_egos(self, egos, dones_mask=None, n_agents=None):
+        """
+        Build global obs tensor padded to N_AGENTS for critic.
+        Curriculum: active agents fill first n_agents*EGO_DIM entries; rest = 0.
+        """
+        n = n_agents if n_agents is not None else len(egos)
+        global_obs = np.zeros(EGO_DIM * N_AGENTS, dtype=np.float32)
+        for i, ego in enumerate(egos[:n]):
+            if dones_mask is not None and dones_mask[i]:
+                continue
+            global_obs[i * EGO_DIM:(i + 1) * EGO_DIM] = ego
         return global_obs
 
     def _normalize_advantages(self, adv: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -153,8 +170,9 @@ class MAPPOTrainer:
         deterministic=False,
         ep_start=False,
     ):
+        n = len(egos)
         if agent_mask is None:
-            agent_mask = np.zeros(N_AGENTS, dtype=bool)
+            agent_mask = np.zeros(n, dtype=bool)
 
         ego_tensor = torch.FloatTensor(np.stack(egos)).unsqueeze(0).to(DEVICE)
         node_tensor = torch.FloatTensor(np.stack(node_feats)).unsqueeze(0).to(DEVICE)
@@ -162,20 +180,21 @@ class MAPPOTrainer:
         nbr_tensor = torch.FloatTensor(np.stack(nbrs_list)).unsqueeze(0).to(DEVICE)
         nbr_mask_tensor = torch.BoolTensor(np.stack(nbr_masks)).unsqueeze(0).to(DEVICE)
         agent_mask_tensor = torch.BoolTensor(agent_mask).unsqueeze(0).to(DEVICE)
-        global_tensor = torch.FloatTensor(global_obs).unsqueeze(0).to(DEVICE)
+        clean_global = self._critic_global_from_egos(egos, dones_mask=agent_mask, n_agents=n)
+        global_tensor = torch.FloatTensor(clean_global).unsqueeze(0).to(DEVICE)
 
         critic_heads = self.policy.critic(global_tensor, head="all")
-        step_value = np.full(N_AGENTS, float(critic_heads["step"].item()), dtype=np.float32)
-        option_value = np.full(N_AGENTS, float(critic_heads["option"].item()), dtype=np.float32)
-        planner_value = np.full(N_AGENTS, float(critic_heads["planner"].item()), dtype=np.float32)
+        step_value = np.full(n, float(critic_heads["step"].item()), dtype=np.float32)
+        option_value = np.full(n, float(critic_heads["option"].item()), dtype=np.float32)
+        planner_value = np.full(n, float(critic_heads["planner"].item()), dtype=np.float32)
         step_value[agent_mask] = 0.0
         option_value[agent_mask] = 0.0
         planner_value[agent_mask] = 0.0
 
-        option_start = self.pending_replan & (~agent_mask)
-        planner_action = np.zeros(N_AGENTS, dtype=np.int64)
-        planner_log_prob = np.zeros(N_AGENTS, dtype=np.float32)
-        planner_reward = np.zeros(N_AGENTS, dtype=np.float32)
+        option_start = self.pending_replan[:n] & (~agent_mask)
+        planner_action = np.zeros(n, dtype=np.int64)
+        planner_log_prob = np.zeros(n, dtype=np.float32)
+        planner_reward = np.zeros(n, dtype=np.float32)
         planner_active_mask = option_start.copy()
 
         planner_state = env.get_planner_state()
@@ -183,9 +202,12 @@ class MAPPOTrainer:
         planner_edge_tensor = torch.FloatTensor(planner_state["edge_feat"]).unsqueeze(0).to(DEVICE)
         planner_adj_tensor = torch.FloatTensor(planner_state["adj"]).unsqueeze(0).to(DEVICE)
         planner_node_mask_tensor = torch.BoolTensor(planner_state["node_mask"]).unsqueeze(0).to(DEVICE)
-        planner_cur_nodes_tensor = torch.LongTensor(planner_state["cur_node_ids"]).unsqueeze(0).to(DEVICE)
-        planner_goal_nodes_tensor = torch.LongTensor(planner_state["goal_node_ids"]).unsqueeze(0).to(DEVICE)
-        planner_route_tensor = torch.FloatTensor(planner_state["route_onehot"]).unsqueeze(0).to(DEVICE)
+        planner_cur_nodes = planner_state["cur_node_ids"][:n]
+        planner_goal_nodes = planner_state["goal_node_ids"][:n]
+        planner_route_onehot = planner_state["route_onehot"][:n]
+        planner_cur_nodes_tensor = torch.LongTensor(planner_cur_nodes).unsqueeze(0).to(DEVICE)
+        planner_goal_nodes_tensor = torch.LongTensor(planner_goal_nodes).unsqueeze(0).to(DEVICE)
+        planner_route_tensor = torch.FloatTensor(planner_route_onehot).unsqueeze(0).to(DEVICE)
         plan_mask_tensor = torch.BoolTensor(option_start).unsqueeze(0).to(DEVICE)
 
         if np.any(planner_active_mask):
@@ -212,7 +234,7 @@ class MAPPOTrainer:
             subgoal_pos_np = planner_out["subgoal_position"].squeeze(0).cpu().numpy()
             subgoal_tok_np = planner_out["subgoal_token"].squeeze(0).cpu().numpy()
             transition_np = planner_out["transition_probs"].squeeze(0).cpu().numpy()
-            route_gain = np.zeros(N_AGENTS, dtype=np.float32)
+            route_gain = np.zeros(n, dtype=np.float32)
 
             for agent_id in np.where(planner_active_mask)[0]:
                 planner_action[agent_id] = int(sampled_nodes_np[agent_id])
@@ -227,11 +249,13 @@ class MAPPOTrainer:
                     planner_state["node_ids"],
                 )
                 self.has_active_option[agent_id] = True
-            planner_reward[planner_active_mask] = env.flow_efficiency_score() + route_gain[planner_active_mask]
+            flow_eff = env.flow_efficiency_score()
+            planner_reward[planner_active_mask] = flow_eff + route_gain[planner_active_mask]
 
-        subgoal_pos_tensor = torch.FloatTensor(self.active_subgoal_pos).unsqueeze(0).to(DEVICE)
-        subgoal_tok_tensor = torch.FloatTensor(self.active_subgoal_token).unsqueeze(0).to(DEVICE)
+        subgoal_pos_tensor = torch.FloatTensor(self.active_subgoal_pos[:n]).unsqueeze(0).to(DEVICE)
+        subgoal_tok_tensor = torch.FloatTensor(self.active_subgoal_token[:n]).unsqueeze(0).to(DEVICE)
         option_start_tensor = torch.BoolTensor(option_start).unsqueeze(0).to(DEVICE)
+
         actions, action_log_probs, terminate_action, terminate_log_prob, terminate_prob = self.policy.executor.sample_policy(
             ego_tensor,
             node_tensor,
@@ -247,7 +271,7 @@ class MAPPOTrainer:
             training_mode=False,
         )
 
-        termination_active_mask = self.has_active_option & (~option_start) & (~agent_mask)
+        termination_active_mask = self.has_active_option[:n] & (~option_start) & (~agent_mask)
         terminate_prob_np = terminate_prob.squeeze(0).cpu().numpy()
         terminate_action_np = terminate_prob_np >= TERMINATION_THRESHOLD
         terminate_log_prob_np = np.where(
@@ -258,7 +282,7 @@ class MAPPOTrainer:
         terminate_action_np[~termination_active_mask] = False
         terminate_log_prob_np[~termination_active_mask] = 0.0
         terminate_prob_np[~termination_active_mask] = 0.0
-        self.pending_replan = terminate_action_np & termination_active_mask
+        self.pending_replan[:n] = terminate_action_np[:n] & termination_active_mask
 
         act_np = actions.squeeze(0).cpu().numpy()
         action_log_prob_np = action_log_probs.squeeze(0).cpu().numpy()
@@ -271,8 +295,8 @@ class MAPPOTrainer:
             "step_values": step_value,
             "option_values": option_value,
             "planner_values": planner_value,
-            "subgoal_positions": self.active_subgoal_pos.copy(),
-            "subgoal_tokens": self.active_subgoal_token.copy(),
+            "subgoal_positions": self.active_subgoal_pos[:n].copy(),
+            "subgoal_tokens": self.active_subgoal_token[:n].copy(),
             "option_start": option_start.copy(),
             "termination_actions": terminate_action_np,
             "termination_log_probs": terminate_log_prob_np,
@@ -282,86 +306,86 @@ class MAPPOTrainer:
             "planner_edge_feats": planner_state["edge_feat"].copy(),
             "planner_adjs": planner_state["adj"].copy(),
             "planner_node_masks": planner_state["node_mask"].copy(),
-            "planner_cur_nodes": planner_state["cur_node_ids"].copy(),
-            "planner_goal_nodes": planner_state["goal_node_ids"].copy(),
-            "planner_route_onehot": planner_state["route_onehot"].copy(),
+            "planner_cur_nodes": planner_cur_nodes.copy(),
+            "planner_goal_nodes": planner_goal_nodes.copy(),
+            "planner_route_onehot": planner_route_onehot.copy(),
             "planner_actions": planner_action,
             "planner_log_probs": planner_log_prob,
             "planner_rewards": planner_reward,
             "planner_active_masks": planner_active_mask,
         }
 
-    def update(self, last_egos, last_dones) -> None:
+    def update(self, last_egos, last_dones, n_agents=None) -> None:
+        n = n_agents if n_agents is not None else self._cur_n_agents
         rollout_len = len(self.buf)
         if rollout_len == 0:
             return
 
         with torch.no_grad():
-            clean_last_g = self._critic_global_from_egos(last_egos, dones_mask=last_dones)
+            clean_last_g = self._critic_global_from_egos(last_egos, dones_mask=last_dones, n_agents=n)
             global_tensor = torch.FloatTensor(clean_last_g).unsqueeze(0).to(DEVICE)
             last_heads = self.policy.critic(global_tensor, head="all")
             last_step_v = np.full(N_AGENTS, float(last_heads["step"].item()), dtype=np.float32)
             last_option_v = np.full(N_AGENTS, float(last_heads["option"].item()), dtype=np.float32)
             last_planner_v = np.full(N_AGENTS, float(last_heads["planner"].item()), dtype=np.float32)
-        alive_mask = (~last_dones).astype(np.float32)
-        last_step_v *= alive_mask
-        last_option_v *= alive_mask
-        last_planner_v *= alive_mask
+        alive_mask = (~np.asarray(last_dones, dtype=bool)).astype(np.float32)
+        # Pad to N_AGENTS
+        alive_full = np.zeros(N_AGENTS, dtype=np.float32)
+        alive_full[:len(alive_mask)] = alive_mask
+        last_step_v *= alive_full
+        last_option_v *= alive_full
+        last_planner_v *= alive_full
 
-        rewards = np.array(self.buf.rewards, dtype=np.float32)
+        rewards = np.array(self.buf.rewards, dtype=np.float32)        # (T, n)
         dones = np.array(self.buf.dones, dtype=np.float32)
         masks = np.array(self.buf.active_masks, dtype=np.float32)
         ep_start = np.array(self.buf.ep_start, dtype=bool)
 
-        step_values = np.array(self.buf.step_values, dtype=np.float32) * masks
-        option_values = np.array(self.buf.option_values, dtype=np.float32) * masks
-        planner_values = np.array(self.buf.planner_values, dtype=np.float32) * masks
+        # Pad to N_AGENTS on agent axis for GAE (critic is N_AGENTS wide)
+        T = rewards.shape[0]
+        cur_n = rewards.shape[1]
 
-        step_terminal = np.maximum(dones, 1.0 - masks)
-        option_terminal = np.maximum(np.array(self.buf.option_end, dtype=np.float32), 1.0 - masks)
-        planner_rewards = np.array(self.buf.planner_rewards, dtype=np.float32) * np.array(
-            self.buf.planner_active_masks,
-            dtype=np.float32,
-        )
+        def pad_agent(arr, fill=0.0):
+            """Pad 2D (T, cur_n) → (T, N_AGENTS)."""
+            if arr.shape[1] == N_AGENTS:
+                return arr
+            out = np.full((T, N_AGENTS), fill, dtype=arr.dtype)
+            out[:, :cur_n] = arr
+            return out
 
-        step_adv, step_ret = self._compute_gae(
-            rewards,
-            step_values,
-            masks,
-            step_terminal,
-            ep_start,
-            last_step_v,
-            LOW_LEVEL_GAMMA,
-            LOW_LEVEL_GAE_LAMBDA,
-        )
-        option_adv, option_ret = self._compute_gae(
-            rewards,
-            option_values,
-            masks,
-            option_terminal,
-            ep_start,
-            last_option_v,
-            OPTION_GAMMA,
-            OPTION_GAE_LAMBDA,
-        )
-        planner_adv, planner_ret = self._compute_gae(
-            planner_rewards,
-            planner_values,
-            masks,
-            step_terminal,
-            ep_start,
-            last_planner_v,
-            PLANNER_GAMMA,
-            PLANNER_GAE_LAMBDA,
+        rewards_p = pad_agent(rewards)
+        dones_p = pad_agent(dones)
+        masks_p = pad_agent(masks)
+
+        step_values = pad_agent(np.array(self.buf.step_values, dtype=np.float32)) * masks_p
+        option_values = pad_agent(np.array(self.buf.option_values, dtype=np.float32)) * masks_p
+        planner_values = pad_agent(np.array(self.buf.planner_values, dtype=np.float32)) * masks_p
+
+        step_terminal = np.maximum(dones_p, 1.0 - masks_p)
+        option_terminal = np.maximum(pad_agent(np.array(self.buf.option_end, dtype=np.float32)), 1.0 - masks_p)
+        planner_rewards = pad_agent(np.array(self.buf.planner_rewards, dtype=np.float32)) * pad_agent(
+            np.array(self.buf.planner_active_masks, dtype=np.float32)
         )
 
-        term_mask_t = np.array(self.buf.termination_active_masks, dtype=np.float32)
-        planner_mask_t = np.array(self.buf.planner_active_masks, dtype=np.float32)
-        step_adv = self._normalize_advantages(step_adv, masks)
+        step_adv, step_ret = self._compute_gae(rewards_p, step_values, masks_p, step_terminal, ep_start, last_step_v, LOW_LEVEL_GAMMA, LOW_LEVEL_GAE_LAMBDA)
+        option_adv, option_ret = self._compute_gae(rewards_p, option_values, masks_p, option_terminal, ep_start, last_option_v, OPTION_GAMMA, OPTION_GAE_LAMBDA)
+        planner_adv, planner_ret = self._compute_gae(planner_rewards, planner_values, masks_p, step_terminal, ep_start, last_planner_v, PLANNER_GAMMA, PLANNER_GAE_LAMBDA)
+
+        term_mask_t = pad_agent(np.array(self.buf.termination_active_masks, dtype=np.float32))
+        planner_mask_t = pad_agent(np.array(self.buf.planner_active_masks, dtype=np.float32))
+        step_adv = self._normalize_advantages(step_adv, masks_p)
         option_adv = self._normalize_advantages(option_adv, term_mask_t)
         planner_adv = self._normalize_advantages(planner_adv, planner_mask_t)
 
-        ego_t = np.array(self.buf.egos, dtype=np.float32)
+        # For actor update, use un-padded (cur_n) slices
+        step_adv_n = step_adv[:, :cur_n]
+        option_adv_n = option_adv[:, :cur_n]
+        step_ret_n = step_ret[:, :cur_n]
+        option_ret_n = option_ret[:, :cur_n]
+        planner_ret_n = planner_ret[:, :cur_n]
+        masks_n = masks_p[:, :cur_n]
+
+        ego_t = np.array(self.buf.egos, dtype=np.float32)              # (T, cur_n, EGO_DIM)
         node_t = np.array(self.buf.node_feats, dtype=np.float32)
         adj_t = np.array(self.buf.adjs, dtype=np.float32)
         nbr_t = np.array(self.buf.nbrs, dtype=np.float32)
@@ -369,11 +393,12 @@ class MAPPOTrainer:
         global_t = np.array(self.buf.globals, dtype=np.float32)
         act_t = np.array(self.buf.actions, dtype=np.float32)
         act_lp_t = np.array(self.buf.action_log_probs, dtype=np.float32)
-        subgoal_pos_t = np.array(self.buf.subgoal_positions, dtype=np.float32)
-        subgoal_token_t = np.array(self.buf.subgoal_tokens, dtype=np.float32)
-        option_start_t = np.array(self.buf.option_start, dtype=bool)
-        term_action_t = np.array(self.buf.termination_actions, dtype=np.float32)
-        term_lp_t = np.array(self.buf.termination_log_probs, dtype=np.float32)
+        subgoal_pos_t = np.array(self.buf.subgoal_positions, dtype=np.float32)   # (T, N_AGENTS, 3)
+        subgoal_token_t = np.array(self.buf.subgoal_tokens, dtype=np.float32)    # (T, N_AGENTS, HIDDEN)
+        option_start_t = np.array(self.buf.option_start, dtype=bool)             # (T, N_AGENTS)
+        term_action_t = np.array(self.buf.termination_actions, dtype=np.float32) # (T, N_AGENTS)
+        term_lp_t = np.array(self.buf.termination_log_probs, dtype=np.float32)   # (T, N_AGENTS)
+        term_mask_n = np.array(self.buf.termination_active_masks, dtype=np.float32)
 
         planner_node_t = np.array(self.buf.planner_node_feats, dtype=np.float32)
         planner_edge_t = np.array(self.buf.planner_edge_feats, dtype=np.float32)
@@ -384,8 +409,9 @@ class MAPPOTrainer:
         planner_route_t = np.array(self.buf.planner_route_onehot, dtype=np.float32)
         planner_action_t = np.array(self.buf.planner_actions, dtype=np.int64)
         planner_lp_t = np.array(self.buf.planner_log_probs, dtype=np.float32)
+        planner_mask_n = np.array(self.buf.planner_active_masks, dtype=np.float32)
 
-        valid_t = np.any(masks > 0.5, axis=1)
+        valid_t = np.any(masks_n > 0.5, axis=1)
         idxs = np.where(valid_t)[0]
         if len(idxs) == 0:
             self.buf.clear()
@@ -419,41 +445,46 @@ class MAPPOTrainer:
             for start, end in chunks:
                 b = np.arange(start, end, dtype=np.int64)
 
-                bE = torch.FloatTensor(ego_t[b]).to(DEVICE)
+                bE = torch.FloatTensor(ego_t[b]).to(DEVICE)            # (B, cur_n, EGO_DIM)
                 bNF = torch.FloatTensor(node_t[b]).to(DEVICE)
                 bADJ = torch.FloatTensor(adj_t[b]).to(DEVICE)
                 bNB = torch.FloatTensor(nbr_t[b]).to(DEVICE)
                 bNM = torch.BoolTensor(nbr_mask_t[b]).to(DEVICE)
-                bSGP = torch.FloatTensor(subgoal_pos_t[b]).to(DEVICE)
+                bSGP = torch.FloatTensor(subgoal_pos_t[b]).to(DEVICE)  # (B, N_AGENTS, 3)
                 bSGT = torch.FloatTensor(subgoal_token_t[b]).to(DEVICE)
                 bA = torch.FloatTensor(act_t[b]).to(DEVICE)
                 bOldLP = torch.FloatTensor(act_lp_t[b]).to(DEVICE)
-                bStepADV = torch.FloatTensor(step_adv[b]).to(DEVICE)
-                bOptionADV = torch.FloatTensor(option_adv[b]).to(DEVICE)
-                bStepRET = torch.FloatTensor(step_ret[b]).to(DEVICE)
-                bOptionRET = torch.FloatTensor(option_ret[b]).to(DEVICE)
-                bPlannerRET = torch.FloatTensor(planner_ret[b]).to(DEVICE)
-                bM = torch.FloatTensor(masks[b]).to(DEVICE)
+                bStepADV = torch.FloatTensor(step_adv_n[b]).to(DEVICE)
+                bOptionADV = torch.FloatTensor(option_adv_n[b]).to(DEVICE)
+                bStepRET = torch.FloatTensor(step_ret_n[b]).to(DEVICE)
+                bOptionRET = torch.FloatTensor(option_ret_n[b]).to(DEVICE)
+                bPlannerRET = torch.FloatTensor(planner_ret_n[b]).to(DEVICE)
+                bM = torch.FloatTensor(masks_n[b]).to(DEVICE)
                 bAM = bM < 0.5
-                bOS = torch.BoolTensor(option_start_t[b]).to(DEVICE)
+                bOS = torch.BoolTensor(option_start_t[b]).to(DEVICE)   # (B, N_AGENTS)
                 bEP = torch.BoolTensor(ep_start[b]).to(DEVICE)
 
-                bTA = torch.FloatTensor(term_action_t[b]).to(DEVICE)
+                bTA = torch.FloatTensor(term_action_t[b]).to(DEVICE)   # (B, N_AGENTS)
                 bOldTermLP = torch.FloatTensor(term_lp_t[b]).to(DEVICE)
-                bTM = torch.FloatTensor(term_mask_t[b]).to(DEVICE)
+                bTM = torch.FloatTensor(term_mask_n[b]).to(DEVICE)     # (B, N_AGENTS)
+
+                # Executor forward: pass cur_n agents, full N_AGENTS buffers for subgoal/term
+                # Slice subgoal to cur_n agent dimension for executor
+                bSGP_n = bSGP[:, :cur_n, :]
+                bSGT_n = bSGT[:, :cur_n, :]
+                bOS_n = bOS[:, :cur_n]
+                bTA_n = bTA[:, :cur_n]
+                bOldTermLP_n = bOldTermLP[:, :cur_n]
+                bTM_n = bTM[:, :cur_n]
+                bOptionADV_n = bOptionADV
 
                 action_lp, action_ent, term_lp, term_ent = self.policy.executor.evaluate_policy(
-                    bE,
-                    bNF,
-                    bADJ,
-                    bNB,
-                    bNM,
-                    bA,
-                    bTA,
-                    subgoal_pos=bSGP,
-                    subgoal_token=bSGT,
+                    bE, bNF, bADJ, bNB, bNM,
+                    bA, bTA_n,
+                    subgoal_pos=bSGP_n,
+                    subgoal_token=bSGT_n,
                     agent_mask=bAM,
-                    option_start=bOS,
+                    option_start=bOS_n,
                     ep_start=bEP,
                     training_mode=True,
                 )
@@ -464,11 +495,11 @@ class MAPPOTrainer:
                 action_loss = (-torch.min(s1, s2) - self._ent_coef * action_ent) * bM
                 action_loss = action_loss.sum() / (bM.sum() + 1e-8)
 
-                ratio_term = (term_lp - bOldTermLP).exp() * bTM
-                t1 = ratio_term * bOptionADV
-                t2 = ratio_term.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * bOptionADV
-                term_loss = (-torch.min(t1, t2) - 0.5 * self._ent_coef * term_ent) * bTM
-                term_loss = term_loss.sum() / (bTM.sum() + 1e-8)
+                ratio_term = (term_lp - bOldTermLP_n).exp() * bTM_n
+                t1 = ratio_term * bOptionADV_n
+                t2 = ratio_term.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * bOptionADV_n
+                term_loss = (-torch.min(t1, t2) - 0.5 * self._ent_coef * term_ent) * bTM_n
+                term_loss = term_loss.sum() / (bTM_n.sum() + 1e-8)
 
                 self.opt_exec.zero_grad()
                 exec_loss = action_loss + term_loss
@@ -485,18 +516,12 @@ class MAPPOTrainer:
                 bPROUTE = torch.FloatTensor(planner_route_t[b]).to(DEVICE)
                 bPA = torch.LongTensor(planner_action_t[b]).to(DEVICE)
                 bOldPlanLP = torch.FloatTensor(planner_lp_t[b]).to(DEVICE)
-                bPlanMaskBool = torch.BoolTensor(planner_mask_t[b] > 0.5).to(DEVICE)
-                bPlanMask = torch.FloatTensor(planner_mask_t[b]).to(DEVICE)
-                bPlanADV = torch.FloatTensor(planner_adv[b]).to(DEVICE)
+                bPlanMaskBool = torch.BoolTensor(planner_mask_n[b] > 0.5).to(DEVICE)
+                bPlanMask = torch.FloatTensor(planner_mask_n[b]).to(DEVICE)
+                bPlanADV = torch.FloatTensor(planner_adv[:, :cur_n][b]).to(DEVICE)
 
                 _, plan_lp, plan_ent = self.policy.planner.evaluate_action(
-                    bPNF,
-                    bPEF,
-                    bE,
-                    bPADJ,
-                    bPCUR,
-                    bPGOAL,
-                    bPA,
+                    bPNF, bPEF, bE, bPADJ, bPCUR, bPGOAL, bPA,
                     existing_route_onehot=bPROUTE,
                     plan_mask=bPlanMaskBool,
                     node_mask=bPNM,
@@ -533,7 +558,7 @@ class MAPPOTrainer:
                 actor_losses.append(float((exec_loss + planner_loss).item()))
 
         self.loss_hist.append(np.mean(actor_losses) if actor_losses else 0.0)
-        self.total_t += int(np.sum(masks))
+        self.total_t += int(np.sum(masks_n))
         self.buf.clear()
         self.update_cnt += 1
 
@@ -543,7 +568,9 @@ class MAPPOTrainer:
         else:
             self.policy.executor.comm_alpha = 0.0
 
-        self._ent_coef = max(0.003, ENT_COEF * (0.9995 ** self.update_cnt))
+        # INNOVATION: adaptive entropy with slower decay
+        self._ent_coef = max(ENT_COEF_MIN, ENT_COEF * (ENT_COEF_DECAY ** self.update_cnt))
+
         if self.update_cnt % 100 == 0:
             for param_group in self.opt_exec.param_groups:
                 param_group["lr"] *= 0.997

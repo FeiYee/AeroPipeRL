@@ -1,49 +1,73 @@
 #!/usr/bin/env python3
 """Watch a trained model on CPU with GUI rendering."""
+
+from __future__ import annotations
+
 import argparse
+
 import numpy as np
 import pygame
-from pygame.locals import DOUBLEBUF, OPENGL, QUIT, KEYDOWN, K_ESCAPE, K_q, K_r, K_SPACE
-from OpenGL.GL import *
-from OpenGL.GLU import *
 import torch
+from OpenGL.GL import (
+    GL_BLEND,
+    GL_COLOR_BUFFER_BIT,
+    GL_DEPTH_BUFFER_BIT,
+    GL_DEPTH_TEST,
+    GL_LINES,
+    GL_LINE_STRIP,
+    GL_MODELVIEW,
+    GL_ONE_MINUS_SRC_ALPHA,
+    GL_PROJECTION,
+    GL_SRC_ALPHA,
+    glBegin,
+    glBlendFunc,
+    glClear,
+    glClearColor,
+    glColor3f,
+    glColor4f,
+    glEnable,
+    glEnd,
+    glLineWidth,
+    glLoadIdentity,
+    glMatrixMode,
+    glPopMatrix,
+    glPushMatrix,
+    glTranslatef,
+    glVertex3f,
+)
+from OpenGL.GLU import gluPerspective, gluSphere
+from pygame.locals import DOUBLEBUF, KEYDOWN, K_ESCAPE, K_SPACE, K_q, K_r, OPENGL, QUIT
 
-from aeropipe_rl.config import DEVICE, BEST_CKPT_PATH, LATEST_CKPT_PATH, N_AGENTS, AGENT_COLORS, W, H, WATCH_SPF, WATCH_PAUSE, AGENT_R
-from aeropipe_rl.environment import PipeNet, MAEnv
-from aeropipe_rl.render import Camera, HUD, draw_pipe_network
+import aeropipe_rl.config as core_config
+from aeropipe_rl.environment import MAEnv, PipeNet
+from aeropipe_rl.render import Camera, HUD
 from aeropipe_rl.training.trainer import MAPPOTrainer
 
+# Render config
+RENDER_PLANNER_PATH = True
+PLANNER_PATH_ALPHA = 0.3
+PLANNER_PATH_WIDTH = 1.0
 
-# 渲染配置
-RENDER_PLANNER_PATH = True  # 设为False关闭规划路径渲染
-PLANNER_PATH_ALPHA = 0.3  # 路径透明度
-PLANNER_PATH_WIDTH = 1.0  # 路径线宽（极细）
 
-
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", choices=["best", "latest"], default="best",
-                        help="Which checkpoint to load")
+    parser.add_argument("--ckpt", choices=["best", "latest"], default="best", help="Which checkpoint to load")
     args = parser.parse_args()
 
-    # Force CPU
-    DEVICE = torch.device("cpu")
-    DEBUG_GUI = True
+    core_config.DEVICE = torch.device("cpu")
 
-    # Build environment and trainer
     net = PipeNet()
-    env = MAEnv(net)
+    env = MAEnv(net, n_agents=core_config.N_AGENTS)
     trainer = MAPPOTrainer()
+    if hasattr(trainer, "set_n_agents"):
+        trainer.set_n_agents(core_config.N_AGENTS)
 
-    # Load checkpoint
-    ckpt_path = BEST_CKPT_PATH if args.ckpt == "best" else LATEST_CKPT_PATH
+    ckpt_path = core_config.BEST_CKPT_PATH if args.ckpt == "best" else core_config.LATEST_CKPT_PATH
     trainer.load(ckpt_path)
 
-    # Start GUI watch loop (deterministic)
     pygame.init()
-    pygame.display.set_mode((W, H), DOUBLEBUF | OPENGL)
-    pygame.display.set_caption(
-        "Multi-Agent Pipe MARL | WATCH (CPU) | SPACE:mode  R:regen")
+    pygame.display.set_mode((core_config.W, core_config.H), DOUBLEBUF | OPENGL)
+    pygame.display.set_caption("Multi-Agent Pipe MARL | WATCH (CPU) | SPACE:mode  R:regen")
 
     glEnable(GL_DEPTH_TEST)
     glEnable(GL_BLEND)
@@ -52,34 +76,39 @@ def main():
     cam = Camera()
     hud = HUD()
 
-    mode = 'watch'
+    mode = "watch"
     flash_red = 0
-    last_results = [''] * N_AGENTS
+    last_results = [""] * core_config.N_AGENTS
 
     wa_obs = None
     wa_done_all = True
     wa_pause = 0
-    wa_trails = [[] for _ in range(N_AGENTS)]
+    wa_trails = [[] for _ in range(core_config.N_AGENTS)]
     wa_attn_cache = None
-    wa_positions = np.zeros((N_AGENTS, 3))
+    wa_positions = np.zeros((core_config.N_AGENTS, 3), dtype=np.float64)
 
     clock = pygame.time.Clock()
 
     while True:
         for ev in pygame.event.get():
             if ev.type == QUIT:
-                pygame.quit(); return
+                pygame.quit()
+                return
             cam.event(ev)
             if ev.type == KEYDOWN:
                 if ev.key in (K_ESCAPE, K_q):
-                    pygame.quit(); return
-                elif ev.key == K_r:
+                    pygame.quit()
+                    return
+                if ev.key == K_r:
                     net.regenerate()
-                    env = MAEnv(net)
-                    wa_done_all = True; wa_pause = 0
-                    last_results = [''] * N_AGENTS
+                    env = MAEnv(net, n_agents=core_config.N_AGENTS)
+                    if hasattr(trainer, "set_n_agents"):
+                        trainer.set_n_agents(core_config.N_AGENTS)
+                    wa_done_all = True
+                    wa_pause = 0
+                    last_results = [""] * core_config.N_AGENTS
                 elif ev.key == K_SPACE:
-                    mode = 'watch'
+                    mode = "watch"
 
         if wa_pause > 0:
             wa_pause -= 1
@@ -87,80 +116,88 @@ def main():
         elif wa_done_all:
             wa_obs = env.reset()
             trainer.policy.executor.reset_temporal()
-            wa_trails = [[env.positions[i].copy()] for i in range(N_AGENTS)]
+            wa_trails = [[env.positions[i].copy()] for i in range(env.n_agents)]
             wa_done_all = False
             wa_positions = env.positions.copy()
             cam_tgt = np.mean(wa_positions, axis=0)
             wa_attn_cache = None
         else:
-            for _ in range(WATCH_SPF):
+            for _ in range(core_config.WATCH_SPF):
                 if wa_done_all:
                     break
                 egos, node_feats, adjs, nbrs, nbr_masks, g_obs = wa_obs
-                act_output = trainer.act(
-                    egos, node_feats, adjs, nbrs, nbr_masks, g_obs, env,
+                step_out = trainer.act(
+                    egos,
+                    node_feats,
+                    adjs,
+                    nbrs,
+                    nbr_masks,
+                    g_obs,
+                    env,
                     agent_mask=env.dones.copy(),
-                    deterministic=True)
-                acts = act_output["actions"]
-                # 暂时禁用注意力可视化，避免接口不兼容
-                wa_attn_cache = None
+                    deterministic=True,
+                )
+                acts = step_out["actions"]
+                wa_attn_cache = trainer.policy.executor.graph_attn_weights()
 
                 wa_obs, _, dones, results = env.step(acts)
                 wa_positions = env.positions.copy()
 
-                for i in range(N_AGENTS):
+                for i in range(env.n_agents):
                     if not dones[i]:
                         wa_trails[i].append(wa_positions[i].copy())
 
                 if np.all(dones):
                     last_results = results[:]
-                    if any(r == 'wall' for r in results):
+                    if any(r == "wall" for r in results):
                         flash_red = 12
                     wa_done_all = True
-                    wa_pause = WATCH_PAUSE
+                    wa_pause = core_config.WATCH_PAUSE
 
             cam_tgt = np.mean(wa_positions, axis=0)
 
         if flash_red > 0:
-            glClearColor(0.28, 0.0, 0.05, 1.0); flash_red -= 1
+            glClearColor(0.28, 0.0, 0.05, 1.0)
+            flash_red -= 1
         else:
             glClearColor(0.03, 0.03, 0.09, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-        glMatrixMode(GL_PROJECTION); glLoadIdentity()
-        gluPerspective(45, W / H, 0.1, 1000.0)
-        glMatrixMode(GL_MODELVIEW); glLoadIdentity()
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(45, core_config.W / core_config.H, 0.1, 1000.0)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
         cam.apply(cam_tgt)
 
         attn_lines = None
-        if wa_attn_cache is not None and wa_obs is not None:
+        if wa_attn_cache is not None and wa_obs is not None and env.n_agents > 0:
             attn_lines = []
             _, wa_node_feats, _, _, _, _ = wa_obs
             nf0 = wa_node_feats[0]
             cur_idx = int(np.argmax(nf0[:, 6]))
             row = wa_attn_cache[cur_idx]
-            top_idx = np.argsort(-row)[:min(4, len(row))]
+            top_idx = np.argsort(-row)[: min(4, len(row))]
             p0 = wa_positions[0].copy()
             for k in top_idx:
                 rel = nf0[k, :3] * env.net.extent
                 pk = p0 + rel
                 attn_lines.append((p0, pk, float(np.clip(row[k], 0.0, 1.0))))
 
-        draw_pipe_network(
-            net,
+        net.draw(
             starts=env.start_nodes[:],
             goals=env.goal_nodes[:],
             trails=wa_trails,
             waypoints_list=env.waypoints[:],
-            attn_lines=attn_lines)
+            attn_lines=attn_lines,
+        )
 
-        # 渲染规划器生成的全局路径
         if RENDER_PLANNER_PATH:
             glLineWidth(PLANNER_PATH_WIDTH)
-            for i in range(N_AGENTS):
+            for i in range(env.n_agents):
                 if env.dones[i]:
                     continue
-                c = AGENT_COLORS[i % len(AGENT_COLORS)]
+                c = core_config.AGENT_COLORS[i % len(core_config.AGENT_COLORS)]
                 route = env.route_plan[i]
                 if len(route) < 2:
                     continue
@@ -172,12 +209,11 @@ def main():
                 glEnd()
             glLineWidth(1.0)
 
-        # Ultra-thin dashed guide lines: agent -> its goal (real-time)
         glLineWidth(1.0)
-        for i in range(N_AGENTS):
+        for i in range(env.n_agents):
             if env.dones[i]:
                 continue
-            c = AGENT_COLORS[i % len(AGENT_COLORS)]
+            c = core_config.AGENT_COLORS[i % len(core_config.AGENT_COLORS)]
             p0 = wa_positions[i]
             p1 = env.goals[i]
             segs = 28
@@ -193,20 +229,25 @@ def main():
                 glEnd()
         glLineWidth(1.0)
 
-        for i in range(N_AGENTS):
+        if not hasattr(net, "q") or net.q is None:
+            from OpenGL.GLU import gluNewQuadric
+
+            net.q = gluNewQuadric()
+
+        for i in range(env.n_agents):
             if env.dones[i]:
                 continue
-            c = AGENT_COLORS[i % len(AGENT_COLORS)]
+            c = core_config.AGENT_COLORS[i % len(core_config.AGENT_COLORS)]
             glPushMatrix()
             glTranslatef(*wa_positions[i])
             glColor3f(*c[:3])
-            gluSphere(net.q, AGENT_R * 3.0, 16, 16)
+            gluSphere(net.q, core_config.AGENT_R * 3.0, 16, 16)
             glPopMatrix()
 
-        hud.render(trainer, 'watch', env, last_results)
+        hud.render(trainer, "watch", env, last_results)
         pygame.display.flip()
         clock.tick(60)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

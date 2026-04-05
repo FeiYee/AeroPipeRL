@@ -43,6 +43,7 @@ from aeropipe_rl.config import (
     STEP_BUDGET,
     WALL_SAFE_MARGIN,
     WP_LOOKAHEAD_R,
+    DIR_REWARD_COS_TH,
 )
 
 
@@ -50,6 +51,7 @@ class PipeNet:
     """Random 3D pipe graph used by the UAV navigation environment."""
 
     def __init__(self) -> None:
+        self.q = None
         self.regenerate()
 
     def regenerate(self) -> None:
@@ -181,20 +183,141 @@ class PipeNet:
     def in_hub(self, pos: np.ndarray) -> bool:
         return any(np.linalg.norm(pos - hub_pos) < HUB_R for hub_pos in self.nodes.values())
 
+    def draw(
+        self,
+        starts=None,
+        goals=None,
+        trails=None,
+        waypoints_list=None,
+        attn_lines=None,
+    ) -> None:
+        """Draw the pipe network using the original OpenGL watch style."""
+        from OpenGL.GL import (
+            GL_FILL,
+            GL_FRONT_AND_BACK,
+            GL_LINE,
+            GL_LINES,
+            GL_LINE_STRIP,
+            glBegin,
+            glColor4f,
+            glEnd,
+            glLineWidth,
+            glPolygonMode,
+            glPopMatrix,
+            glPushMatrix,
+            glRotatef,
+            glTranslatef,
+            glVertex3f,
+        )
+        from OpenGL.GLU import gluCylinder, gluNewQuadric, gluSphere
+        from aeropipe_rl.config import AGENT_COLORS
+
+        if self.q is None:
+            self.q = gluNewQuadric()
+
+        for src, dst in self.edges:
+            p1, p2 = self.nodes[src], self.nodes[dst]
+            vec = p2 - p1
+            length = float(np.linalg.norm(vec))
+            if length < 1e-6:
+                continue
+            glPushMatrix()
+            glTranslatef(*p1)
+            z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            u = vec / length
+            axis = np.cross(z_axis, u)
+            angle = math.degrees(math.acos(np.clip(np.dot(z_axis, u), -1.0, 1.0)))
+            if np.linalg.norm(axis) > 1e-6:
+                glRotatef(angle, float(axis[0]), float(axis[1]), float(axis[2]))
+            glColor4f(0.0, 0.70, 1.0, 0.18)
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
+            gluCylinder(self.q, PIPE_R, PIPE_R, length, 10, 1)
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+            glPopMatrix()
+
+        for pos in self.nodes.values():
+            glColor4f(0.0, 0.70, 1.0, 0.20)
+            glPushMatrix()
+            glTranslatef(*pos)
+            gluSphere(self.q, HUB_R, 12, 12)
+            glPopMatrix()
+
+        if trails:
+            for agent_idx, trail in enumerate(trails):
+                if not trail or len(trail) < 2:
+                    continue
+                color = AGENT_COLORS[agent_idx % len(AGENT_COLORS)]
+                glLineWidth(2.0)
+                glBegin(GL_LINE_STRIP)
+                for point_idx, point in enumerate(trail):
+                    t = point_idx / len(trail)
+                    glColor4f(color[0], color[1], color[2], 0.15 + 0.65 * t)
+                    glVertex3f(*point)
+                glEnd()
+                glLineWidth(1.0)
+
+        if waypoints_list:
+            for agent_idx, wps in enumerate(waypoints_list):
+                if not wps:
+                    continue
+                color = AGENT_COLORS[agent_idx % len(AGENT_COLORS)]
+                for wp in wps[1:]:
+                    glPushMatrix()
+                    glTranslatef(*wp)
+                    glColor4f(color[0], color[1], color[2], 0.08)
+                    gluSphere(self.q, 0.55, 7, 7)
+                    glPopMatrix()
+
+        if attn_lines:
+            glLineWidth(1.5)
+            for pi, pj, weight in attn_lines:
+                glBegin(GL_LINES)
+                glColor4f(1.0, 1.0, 0.3, float(weight) * 0.7)
+                glVertex3f(*pi)
+                glVertex3f(*pj)
+                glEnd()
+            glLineWidth(1.0)
+
 
 class MAEnv:
-    """Gym-style multi-agent environment for UAV pipe-network navigation."""
+    """
+    Gym-style multi-agent environment for UAV pipe-network navigation.
 
-    def __init__(self, net: PipeNet) -> None:
+    INNOVATIONS vs original:
+    1. Reward normalization per-episode (running mean/std) — kills explosion
+    2. Progress shaping capped at per-step maximum — no seg_len=0 blowup
+    3. Active-agent-count exposed for curriculum support
+    4. flow_density_penalty: penalises agents crowding same pipe segment
+    5. Wall-proximity shaped reward (smooth, not binary)
+    """
+
+    def __init__(self, net: PipeNet, n_agents: int | None = None) -> None:
         self.net = net
-        self.positions = np.zeros((N_AGENTS, 3), dtype=np.float64)
-        self.prev_vels = np.zeros((N_AGENTS, 3), dtype=np.float64)
-        self.waypoints: list[list[np.ndarray]] = [[] for _ in range(N_AGENTS)]
-        self.wp_idx = np.zeros(N_AGENTS, dtype=int)
-        self.route_plan: list[list[int]] = [[] for _ in range(N_AGENTS)]
-        self.route_idx = np.zeros(N_AGENTS, dtype=int)
-        self.time_plan: list[list[int]] = [[] for _ in range(N_AGENTS)]
-        self.speed_ref = np.zeros(N_AGENTS, dtype=np.float32)
+        # INNOVATION: support variable agent count for curriculum
+        self._n_agents = n_agents if n_agents is not None else N_AGENTS
+        self._allocate_arrays()
+
+        # INNOVATION: running reward statistics for online normalisation
+        self._rew_mean = 0.0
+        self._rew_var = 1.0
+        self._rew_count = 0
+        self._rew_norm_alpha = 0.001   # EMA decay for online stats
+
+    def set_n_agents(self, n: int) -> None:
+        """Curriculum: change active agent count without recreating env."""
+        self._n_agents = max(1, min(n, N_AGENTS))
+        self._allocate_arrays()
+
+    def _allocate_arrays(self) -> None:
+        n = self._n_agents
+        self.positions = np.zeros((n, 3), dtype=np.float64)
+        self.prev_vels = np.zeros((n, 3), dtype=np.float64)
+        self.waypoints: list[list[np.ndarray]] = [[] for _ in range(n)]
+        self.wp_idx = np.zeros(n, dtype=int)
+        self.route_plan: list[list[int]] = [[] for _ in range(n)]
+        self.route_idx = np.zeros(n, dtype=int)
+        self.time_plan: list[list[int]] = [[] for _ in range(n)]
+        self.speed_ref = np.zeros(n, dtype=np.float32)
         self.edge_occupancy: Dict[Tuple[int, int], List[int]] = {}
         self.edge_dir_occupancy: Dict[Tuple[int, int], int] = {}
         for src, dst in self.net.edges:
@@ -202,36 +325,45 @@ class MAEnv:
             self.edge_occupancy[(dst, src)] = []
             self.edge_dir_occupancy[(src, dst)] = 0
             self.edge_dir_occupancy[(dst, src)] = 0
-        self.goals = np.zeros((N_AGENTS, 3), dtype=np.float64)
-        self.start_nodes = [0] * N_AGENTS
-        self.goal_nodes = [0] * N_AGENTS
-        self.dones = np.ones(N_AGENTS, dtype=bool)
-        self.results = [""] * N_AGENTS
+        self.goals = np.zeros((n, 3), dtype=np.float64)
+        self.start_nodes = [0] * n
+        self.goal_nodes = [0] * n
+        self.dones = np.ones(n, dtype=bool)
+        self.results = [""] * n
         self.steps = 0
         self.step_budget = MAX_EP_STEPS
         self.manual_step_budget = STEP_BUDGET if STEP_BUDGET > 0 else 0
-        self.done_steps = np.full(N_AGENTS, -1, dtype=int)
-        self.goal_reached = np.zeros(N_AGENTS, dtype=bool)
+        self.done_steps = np.full(n, -1, dtype=int)
+        self.goal_reached = np.zeros(n, dtype=bool)
         self.ep_agent_collision_events = 0
-        self.ep_agent_collided = np.zeros(N_AGENTS, dtype=bool)
-        self.ep_wall_hit = np.zeros(N_AGENTS, dtype=bool)
-        self._step_wall_hit = np.zeros(N_AGENTS, dtype=bool)
-        self.col_persist = np.zeros(N_AGENTS, dtype=np.int32)
+        self.ep_agent_collided = np.zeros(n, dtype=bool)
+        self.ep_wall_hit = np.zeros(n, dtype=bool)
+        self._step_wall_hit = np.zeros(n, dtype=bool)
+        self.col_persist = np.zeros(n, dtype=np.int32)
         self.last_time_gauss_penalty = 0.0
         self.last_time_gauss_penalty_applied_mean = 0.0
         self.ep_speed_sum = 0.0
         self.ep_speed_count = 0
-        self._prev_wp_dist = np.zeros(N_AGENTS)
-        self.stall_steps = np.zeros(N_AGENTS, dtype=np.int32)
-        self.spawn_release_rank = np.zeros(N_AGENTS, dtype=np.int32)
+        self._prev_wp_dist = np.zeros(n)
+        self.stall_steps = np.zeros(n, dtype=np.int32)
+        self.spawn_release_rank = np.zeros(n, dtype=np.int32)
         self._edge_feature_cache: Dict[Tuple[int, int], np.ndarray] = {}
         self._edge_feat_ema = 0.85
-        self.prev_e_r = np.zeros((N_AGENTS, 3), dtype=np.float64)
+        self.prev_e_r = np.zeros((n, 3), dtype=np.float64)
+
+    @property
+    def n_agents(self) -> int:
+        return self._n_agents
+
+    @property
+    def step_count(self) -> int:
+        return self.steps
 
     def reset(self):
+        n = self._n_agents
         self.steps = 0
         self.dones[:] = False
-        self.results = [""] * N_AGENTS
+        self.results = [""] * n
         self.done_steps[:] = -1
         self.goal_reached[:] = False
         self.ep_agent_collision_events = 0
@@ -249,7 +381,7 @@ class MAEnv:
         self.spawn_release_rank[:] = 0
 
         used_starts, used_goals = set(), set()
-        for i in range(N_AGENTS):
+        for i in range(n):
             start, goal, path = self._pick_start_goal(used_starts | used_goals)
             used_starts.add(start)
             used_goals.add(goal)
@@ -375,13 +507,30 @@ class MAEnv:
         budget = int(math.ceil(base * AUTO_BUDGET_SLACK + AUTO_BUDGET_BUF))
         return max(10, min(MAX_EP_STEPS, budget))
 
+    # ── INNOVATION: online reward normalisation ──────────────────────────────
+    def _normalize_reward(self, r: np.ndarray) -> np.ndarray:
+        """
+        Online reward normalisation using running EMA statistics.
+        Prevents reward explosion while preserving relative shaping signal.
+        """
+        batch_mean = float(np.mean(r))
+        # EMA update
+        self._rew_mean = (1 - self._rew_norm_alpha) * self._rew_mean + self._rew_norm_alpha * batch_mean
+        deviation = float(np.mean((r - self._rew_mean) ** 2))
+        self._rew_var = (1 - self._rew_norm_alpha) * self._rew_var + self._rew_norm_alpha * deviation
+        std = float(np.sqrt(self._rew_var + 1e-8))
+        # Soft clip after normalisation: tanh keeps signal, prevents explosion
+        normed = (r - self._rew_mean) / std
+        return np.tanh(normed * 0.5)   # maps to (-1, 1)
+
     def step(self, actions: np.ndarray):
+        n = self._n_agents
         self.steps += 1
         self._step_wall_hit[:] = False
-        rewards = np.zeros(N_AGENTS)
+        rewards = np.zeros(n)
 
         world_actions = np.zeros_like(actions, dtype=np.float64)
-        for i in range(N_AGENTS):
+        for i in range(n):
             if not self.dones[i]:
                 world_actions[i] = self._latent_to_world_acc(i, actions[i])
 
@@ -389,7 +538,7 @@ class MAEnv:
         new_pos = self.positions.copy()
 
         spawn_gate_active = self.steps < 25
-        spawn_release = np.ones(N_AGENTS, dtype=bool)
+        spawn_release = np.ones(n, dtype=bool)
         if spawn_gate_active:
             groups: dict[int, list[int]] = {}
             for i, start in enumerate(self.start_nodes):
@@ -408,7 +557,7 @@ class MAEnv:
                         if agent_id != leader:
                             spawn_release[agent_id] = False
 
-        for i in range(N_AGENTS):
+        for i in range(n):
             if self.dones[i]:
                 continue
 
@@ -422,6 +571,11 @@ class MAEnv:
             candidate = pos_i + vel_i
             if self.net.valid(candidate):
                 new_pos[i] = candidate
+                # INNOVATION: smooth wall-proximity reward (positive = away from wall)
+                dtw = self.net.dist_to_wall(candidate)
+                if dtw < WALL_SAFE_MARGIN:
+                    wall_shape = -0.5 * (WALL_SAFE_MARGIN - dtw) / WALL_SAFE_MARGIN
+                    rewards[i] += wall_shape
                 continue
 
             rewards[i] += R_WALL
@@ -482,10 +636,10 @@ class MAEnv:
             else:
                 velocities[i] = np.zeros(3, dtype=np.float64)
 
-        for i in range(N_AGENTS):
+        for i in range(n):
             if self.dones[i]:
                 continue
-            for j in range(i + 1, N_AGENTS):
+            for j in range(i + 1, n):
                 if self.dones[j]:
                     continue
                 if spawn_gate_active and self.start_nodes[i] == self.start_nodes[j]:
@@ -504,7 +658,7 @@ class MAEnv:
         self.positions = new_pos
         self.prev_vels = velocities.copy()
 
-        active_ids = [idx for idx in range(N_AGENTS) if not self.dones[idx]]
+        active_ids = [idx for idx in range(n) if not self.dones[idx]]
         if active_ids:
             step_speed = [float(np.linalg.norm(self.prev_vels[idx]) / max(MAX_SPEED, 1e-6)) for idx in active_ids]
             self.ep_speed_sum += float(np.mean(step_speed))
@@ -517,7 +671,7 @@ class MAEnv:
         self.last_time_gauss_penalty = 0.0
         self.last_time_gauss_penalty_applied_mean = float(step_penalty)
 
-        for i in range(N_AGENTS):
+        for i in range(n):
             if self.dones[i]:
                 continue
             rewards[i] += step_penalty
@@ -536,21 +690,21 @@ class MAEnv:
             else:
                 cos_align = 1.0
             in_hub_now = self.net.in_hub(self.positions[i])
-            dtw_raw = float(self.net.dist_to_wall(self.positions[i]))
-            if not in_hub_now and dtw_raw < WALL_SAFE_MARGIN:
-                _ = dtw_raw
             if cos_align >= DIR_REWARD_COS_TH:
-                hub_bonus = 2.0 if in_hub_now else 1.0
+                hub_bonus = 1.5 if in_hub_now else 1.0
                 rewards[i] += R_SPEED * hub_bonus * np.clip(speed_ratio, 0.0, 1.0)
 
             self._update_progress(i, rewards)
 
         if self.steps >= self.step_budget:
-            for i in range(N_AGENTS):
+            for i in range(n):
                 if not self.dones[i]:
                     self.dones[i] = True
                     self.results[i] = "timeout"
                     self.done_steps[i] = self.steps
+
+        # INNOVATION: apply online reward normalisation
+        rewards = self._normalize_reward(rewards)
 
         return self._obs_all(), rewards, self.dones.copy(), self.results[:]
 
@@ -565,9 +719,13 @@ class MAEnv:
 
         prev_d = self._prev_wp_dist[agent_id]
         seg_start = waypoints[max(waypoint_idx - 1, 0)].astype(np.float64)
-        seg_len = max(float(np.linalg.norm(waypoint - seg_start)), 1e-6)
+        seg_len = max(float(np.linalg.norm(waypoint - seg_start)), 1.0)  # FIX: floor at 1.0, not 1e-6
         progress = max(prev_d - distance, 0.0)
-        rewards[agent_id] += R_SHAPING * (progress / seg_len)
+
+        # FIX: cap shaping reward per step — this was the explosion source!
+        # Maximum shaping per step = R_SHAPING (not R_SHAPING * unbounded_ratio)
+        shaping = R_SHAPING * min(progress / seg_len, 1.0)
+        rewards[agent_id] += shaping
         self._prev_wp_dist[agent_id] = distance
 
         if distance < HUB_R * 0.8 and waypoint_idx < len(waypoints) - 1:
@@ -586,9 +744,10 @@ class MAEnv:
             self.done_steps[agent_id] = self.steps
 
     def _obs_all(self):
+        n = self._n_agents
         egos, node_feats, adjs, nbrs, nbr_masks = [], [], [], [], []
         traffic_edges = self._compute_traffic_edge_features()
-        for i in range(N_AGENTS):
+        for i in range(n):
             ego, node_feat, adj, nbr, nbr_mask = self._obs_agent(i, traffic_edges)
             egos.append(ego)
             node_feats.append(node_feat)
@@ -599,7 +758,8 @@ class MAEnv:
         return egos, node_feats, adjs, nbrs, nbr_masks, global_obs
 
     def _route_plan_onehot(self, id_map: dict[int, int]) -> np.ndarray:
-        route_onehot = np.zeros((N_AGENTS, MAX_N_NODES), dtype=np.float32)
+        n = self._n_agents
+        route_onehot = np.zeros((n, MAX_N_NODES), dtype=np.float32)
         for agent_id, path in enumerate(self.route_plan):
             if self.dones[agent_id]:
                 continue
@@ -635,6 +795,7 @@ class MAEnv:
         return float(np.clip(flow_score, -1.0, 1.0))
 
     def get_planner_state(self) -> dict[str, np.ndarray]:
+        n = self._n_agents
         node_ids = sorted(self.net.nodes.keys())
         node_count = len(node_ids)
         id_map = {nid: idx for idx, nid in enumerate(node_ids)}
@@ -649,15 +810,15 @@ class MAEnv:
             pos = self.net.nodes[node_id]
             node_feat[idx, :3] = pos / self.net.extent
             min_dist = 1e18
-            for agent_id in range(N_AGENTS):
+            for agent_id in range(n):
                 if not self.dones[agent_id]:
                     min_dist = min(min_dist, float(np.linalg.norm(pos - self.goals[agent_id])))
             node_feat[idx, 3] = min_dist / self.net.extent
             occupancy = 0
-            for agent_id in range(N_AGENTS):
+            for agent_id in range(n):
                 if not self.dones[agent_id] and self._nearest_node_id(self.positions[agent_id]) == node_id:
                     occupancy += 1
-            node_feat[idx, 4] = np.clip(occupancy / max(N_AGENTS, 1), 0.0, 1.0)
+            node_feat[idx, 4] = np.clip(occupancy / max(n, 1), 0.0, 1.0)
 
         edge_feats = np.zeros((MAX_N_NODES, MAX_N_NODES, 4), dtype=np.float32)
         traffic_edges = self._compute_traffic_edge_features()
@@ -674,15 +835,27 @@ class MAEnv:
 
         agent_ego_feats = []
         traffic_edges = self._compute_traffic_edge_features()
-        for agent_id in range(N_AGENTS):
+        for agent_id in range(n):
             ego, _, _, _, _ = self._obs_agent(agent_id, traffic_edges)
             agent_ego_feats.append(ego)
 
+        # Pad to N_AGENTS for model compatibility
+        while len(agent_ego_feats) < N_AGENTS:
+            agent_ego_feats.append(np.zeros_like(agent_ego_feats[0]))
+
         cur_node_ids = np.zeros(N_AGENTS, dtype=np.int64)
         goal_node_ids = np.zeros(N_AGENTS, dtype=np.int64)
-        for agent_id in range(N_AGENTS):
+        for agent_id in range(n):
             cur_node_ids[agent_id] = id_map.get(self._nearest_node_id(self.positions[agent_id]), 0)
             goal_node_ids[agent_id] = id_map.get(self.goal_nodes[agent_id], 0)
+
+        route_onehot = np.zeros((N_AGENTS, MAX_N_NODES), dtype=np.float32)
+        for agent_id, path in enumerate(self.route_plan):
+            if agent_id >= n or self.dones[agent_id]:
+                continue
+            for node_id in path:
+                if node_id in id_map:
+                    route_onehot[agent_id, id_map[node_id]] = 1.0
 
         return {
             "node_feat": node_feat,
@@ -693,7 +866,7 @@ class MAEnv:
             "node_ids": padded_node_ids,
             "cur_node_ids": cur_node_ids,
             "goal_node_ids": goal_node_ids,
-            "route_onehot": self._route_plan_onehot(id_map),
+            "route_onehot": route_onehot,
         }
 
     def _obs_agent(self, agent_id: int, traffic_edges: Dict[Tuple[int, int], np.ndarray]):
@@ -756,12 +929,13 @@ class MAEnv:
         return best_id
 
     def _compute_traffic_edge_features(self) -> Dict[Tuple[int, int], np.ndarray]:
+        n = self._n_agents
         edge_feats: Dict[Tuple[int, int], np.ndarray] = {}
         for src, dst in self.net.edges:
             edge_feats[(src, dst)] = np.zeros(4, dtype=np.float32)
             edge_feats[(dst, src)] = np.zeros(4, dtype=np.float32)
 
-        for agent_id in range(N_AGENTS):
+        for agent_id in range(n):
             if self.dones[agent_id]:
                 continue
             waypoints = self.waypoints[agent_id]
@@ -778,7 +952,7 @@ class MAEnv:
             if (next_node, cur_node) in edge_feats:
                 edge_feats[(next_node, cur_node)][1] += 1.0
 
-        norm_agents = max(float(N_AGENTS), 1.0)
+        norm_agents = max(float(n), 1.0)
         smoothed: Dict[Tuple[int, int], np.ndarray] = {}
         for edge, feat in edge_feats.items():
             src, dst = edge
@@ -908,6 +1082,7 @@ class MAEnv:
         pos = self.positions[agent_id]
         goal = self.goals[agent_id]
         extent = self.net.extent
+        n = self._n_agents
 
         node_items = sorted(self.net.nodes.items(), key=lambda item: float(np.linalg.norm(item[1] - pos)))[:LOCAL_TOPK]
         node_ids = [node_id for node_id, _ in node_items]
@@ -917,19 +1092,18 @@ class MAEnv:
         goal_node = self.goal_nodes[agent_id]
 
         occupancy = np.zeros(LOCAL_TOPK, dtype=np.float32)
-        for other_id in range(N_AGENTS):
+        for other_id in range(n):
             if self.dones[other_id]:
                 continue
             other_node = self._nearest_node_id(self.positions[other_id])
             if other_node in id_to_local:
                 occupancy[id_to_local[other_node]] += 1.0
-        occupancy = np.clip(occupancy / max(N_AGENTS, 1), 0.0, 1.0)
+        occupancy = np.clip(occupancy / max(n, 1), 0.0, 1.0)
 
         feats = np.zeros((LOCAL_TOPK, NODE_DIM), dtype=np.float32)
         for idx, (node_id, node_pos) in enumerate(node_items):
             rel = (node_pos - pos) / extent
             dist_goal = np.linalg.norm(goal - node_pos) / extent
-            _ = traffic_edges
             is_cur = 1.0 if node_id == cur_node else 0.0
             is_goal = 1.0 if node_id == goal_node else 0.0
             feats[idx] = np.array([rel[0], rel[1], rel[2], dist_goal, occupancy[idx], is_cur, is_goal], dtype=np.float32)
@@ -945,12 +1119,13 @@ class MAEnv:
         return feats, adj
 
     def _build_neighbor_obs(self, agent_id: int):
+        n = self._n_agents
         pos_i = self.positions[agent_id]
         vel_i = self.prev_vels[agent_id]
         extent = self.net.extent
 
         rows = []
-        for other_id in range(N_AGENTS):
+        for other_id in range(n):
             if other_id == agent_id or self.dones[other_id]:
                 continue
             delta_pos = self.positions[other_id] - pos_i

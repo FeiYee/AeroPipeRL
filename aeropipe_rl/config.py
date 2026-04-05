@@ -9,18 +9,20 @@ CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 LATEST_CKPT_PATH = CHECKPOINT_DIR / "pipe_marl_latest.pt"
 BEST_CKPT_PATH = CHECKPOINT_DIR / "pipe_marl_best.pt"
 
-N_AGENTS = 20
+N_AGENTS = 6                  # FIX: 20 agents in a 26-node graph is severely overcrowded
+                               # ~0.77 agents/node causes constant collisions & reward explosion
+                               # 6 agents gives room to learn, scale up later
 MAX_N_NODES = 26
 MAX_N_EDGES = MAX_N_NODES * MAX_N_NODES
-MIN_PATH_LEN = 5
+MIN_PATH_LEN = 4              # FIX: was 5, eased slightly for sparser graph connectivity
 
-PIPE_R = 1.6
-HUB_R = 1.8
-WP_LOOKAHEAD_R = HUB_R * 0.5
+PIPE_R = 2.0                  # FIX: was 1.6 — slightly wider pipe so agent can actually fit + move
+HUB_R = 2.2                   # FIX: was 1.8 — proportional to pipe
+WP_LOOKAHEAD_R = HUB_R * 0.6  # slightly more lookahead
 AGENT_R = 0.1
-AGENT_COL_R = 0.12
-MAX_SPEED = 0.42
-MAX_ACC = 0.15
+AGENT_COL_R = 0.15            # FIX: was 0.12, small increase to match agent radius better
+MAX_SPEED = 0.55              # FIX: was 0.42, allow slightly faster traversal
+MAX_ACC = 0.20                # FIX: was 0.15, match speed increase
 DT = 1.0
 
 EGO_DIM = 17
@@ -38,7 +40,7 @@ R_ON_TIME = 0.2
 R_CAPACITY = 0.3
 R_CONFLICT = -0.5
 FLOW_ROLLOUT_STEPS = MAX_N_NODES
-TERMINATION_THRESHOLD = 0.60
+TERMINATION_THRESHOLD = 0.55  # FIX: was 0.60, slightly easier to trigger option switch
 TERMINATION_TAU = 2.5
 TERMINATION_V_THRESHOLD = 1.0
 TERMINATION_V_RESET = 0.0
@@ -46,89 +48,104 @@ TERMINATION_V_RESET = 0.0
 HIDDEN = 128
 N_HEADS = 4
 N_LAYERS = 2
-DROPOUT = 0.0
+DROPOUT = 0.05                # FIX: was 0.0, small dropout prevents rapid overfitting
 
 ENABLE_COMM = True
 COMM_ALPHA_INIT = 0.05
 COMM_ALPHA_MAX = 0.40
 
+# ── PPO / Training ──────────────────────────────────────────────────────────
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-LOW_LEVEL_GAMMA = 0.99
-LOW_LEVEL_GAE_LAMBDA = 0.95
-OPTION_GAMMA = 0.97
-OPTION_GAE_LAMBDA = 0.93
-PLANNER_GAMMA = 0.95
-PLANNER_GAE_LAMBDA = 0.90
-LR_ACTOR = 3e-4
-LR_CRITIC = 8e-4
-T_HORIZON = 512
-K_EPOCHS = 4
-MINI_BATCH = 24
-CLIP_EPS = 0.20
-ENT_COEF = 0.015
+LOW_LEVEL_GAMMA = 0.995       # FIX: was 0.99, longer horizon needed for pipe navigation
+LOW_LEVEL_GAE_LAMBDA = 0.97  # FIX: was 0.95
+OPTION_GAMMA = 0.98           # FIX: was 0.97
+OPTION_GAE_LAMBDA = 0.95      # FIX: was 0.93
+PLANNER_GAMMA = 0.97          # FIX: was 0.95
+PLANNER_GAE_LAMBDA = 0.93     # FIX: was 0.90
+LR_ACTOR = 2e-4               # FIX: was 3e-4, slightly slower for stability
+LR_CRITIC = 6e-4              # FIX: was 8e-4
+T_HORIZON = 256               # FIX: was 512, shorter horizon → more frequent updates
+K_EPOCHS = 3                  # FIX: was 4, less reuse prevents destructive updates
+MINI_BATCH = 16               # FIX: was 24, smaller batch fits shorter rollout
+CLIP_EPS = 0.15               # FIX: was 0.20, tighter clip for early stability
+ENT_COEF = 0.025              # FIX: was 0.015, more exploration early
 VAL_COEF = 0.50
-GRAD_NORM = 0.50
-MAX_EP_STEPS = 600
-STEP_BUDGET = 300
+GRAD_NORM = 0.40              # FIX: was 0.50, tighter gradient clipping
+MAX_EP_STEPS = 500
+STEP_BUDGET = 0               # 0 = auto-compute per episode
 
-R_GOAL_BASE = 30.0
-R_GOAL_TEAM_INC = 5.0
-R_WALL = -8.0
-R_AGENT_COL = -4.0
-R_AGENT_COL_PERSIST = -0.5
-COL_PERSIST_STEPS = 3
-R_WP = 5.0
-R_STEP_BASE = -0.05
-R_STEP_OT_START = -0.12
-R_STEP_OT_INC = -0.01
-R_STEP_OT_MIN = -0.30
-R_SHAPING = 2.0
-R_SPEED = 0.15
-DIR_REWARD_COS_TH = 0.0
+# ── Reward shaping ───────────────────────────────────────────────────────────
+# FIX: This was the reward explosion source.
+# R_SHAPING * (progress/seg_len) could blow up when seg_len ≈ 0.
+# Solution: cap shaping, reduce magnitude, rely more on sparse goal rewards.
+R_GOAL_BASE = 50.0            # FIX: was 30, clearer goal signal
+R_GOAL_TEAM_INC = 3.0         # FIX: was 5.0, reduced team bonus
+R_WALL = -3.0                 # FIX: was -8.0. Large wall penalty causes panic/thrashing.
+                               # Smaller penalty + inward guidance is more informative.
+R_AGENT_COL = -2.0            # FIX: was -4.0, same reasoning
+R_AGENT_COL_PERSIST = -0.2   # FIX: was -0.5
+COL_PERSIST_STEPS = 2         # FIX: was 3
+R_WP = 2.0                    # FIX: was 5.0, waypoint bonus was too dominant
+R_STEP_BASE = -0.02           # FIX: was -0.05, lighter step penalty
+R_STEP_OT_START = -0.06       # FIX: was -0.12
+R_STEP_OT_INC = -0.005        # FIX: was -0.01
+R_STEP_OT_MIN = -0.15         # FIX: was -0.30
+R_SHAPING = 0.5               # FIX: was 2.0! This was the explosion source.
+                               # Also added a cap in environment._update_progress
+R_SPEED = 0.08                # FIX: was 0.15
+DIR_REWARD_COS_TH = 0.1       # FIX: was 0.0, require slight alignment before rewarding speed
 WALL_SAFE_MARGIN = 0.60
-R_WALL_NEAR = 2.0
+R_WALL_NEAR = 0.0             # disabled
 
-AUTO_BUDGET_SLACK = 1.6
-AUTO_BUDGET_BUF = 20.0
+AUTO_BUDGET_SLACK = 2.0       # FIX: was 1.6, give more budget
+AUTO_BUDGET_BUF = 30.0        # FIX: was 20.0
+
+# ── INNOVATION: Curriculum learning flags ────────────────────────────────────
+# Agents start with N_AGENTS_CURRICULUM and scale up to N_AGENTS
+CURRICULUM_ENABLED = True
+N_AGENTS_START = 2            # start with just 2 agents
+N_AGENTS_TARGET = 6           # ramp to full 6
+CURRICULUM_RAMP_EP = 2000     # episodes to reach full agent count
+
+# ── INNOVATION: Adaptive entropy ─────────────────────────────────────────────
+ENT_COEF_MIN = 0.003
+ENT_COEF_DECAY = 0.9997      # FIX: was 0.9995, slightly slower decay
 
 GLOBAL_SEED = 42
 LOG_EVERY_EP = 10
 SAVE_EVERY_EP = 100
-MAX_TRAIN_EPISODES = 200000
+MAX_TRAIN_EPISODES = 200_000
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 可视化配置
+# GUI / watch mode defaults
 W = 1280
 H = 800
-WATCH_SPF = 1         # 每渲染帧运行的环境步数（观看模式）
-WATCH_PAUSE = 80      # 观看模式下两局之间的暂停帧数
-
-# Agent颜色调色板 (RGBA 0-1)
+WATCH_SPF = 1
+WATCH_PAUSE = 80
 AGENT_COLORS = [
-    (0.10, 0.90, 1.00, 1.0),   # cyan
-    (1.00, 0.55, 0.05, 1.0),   # orange
-    (0.20, 1.00, 0.35, 1.0),   # green
-    (0.90, 0.20, 1.00, 1.0),   # purple
-    (1.00, 0.20, 0.20, 1.0),   # red
-    (0.20, 0.40, 1.00, 1.0),   # blue
-    (1.00, 0.90, 0.20, 1.0),   # yellow
-    (0.00, 0.80, 0.80, 1.0),   # teal
-    (0.80, 0.40, 0.00, 1.0),   # brown
-    (1.00, 0.00, 0.70, 1.0),   # magenta
-    (0.50, 1.00, 0.00, 1.0),   # lime
-    (0.00, 0.50, 1.00, 1.0),   # sky blue
-    (0.60, 0.00, 1.00, 1.0),   # violet
-    (1.00, 0.30, 0.60, 1.0),   # pink
-    (0.40, 0.80, 0.20, 1.0),   # olive green
-    (0.30, 0.30, 0.30, 1.0),   # dark gray
-    (0.70, 0.70, 0.70, 1.0),   # light gray
-    (0.00, 0.60, 0.40, 1.0),   # sea green
-    (0.80, 0.20, 0.00, 1.0),   # dark orange-red
-    (0.20, 0.00, 0.60, 1.0),   # indigo
+    (0.10, 0.90, 1.00, 1.0),
+    (1.00, 0.55, 0.05, 1.0),
+    (0.20, 1.00, 0.35, 1.0),
+    (0.90, 0.20, 1.00, 1.0),
+    (1.00, 0.20, 0.20, 1.0),
+    (0.20, 0.40, 1.00, 1.0),
+    (1.00, 0.90, 0.20, 1.0),
+    (0.00, 0.80, 0.80, 1.0),
+    (0.80, 0.40, 0.00, 1.0),
+    (1.00, 0.00, 0.70, 1.0),
+    (0.50, 1.00, 0.00, 1.0),
+    (0.00, 0.50, 1.00, 1.0),
+    (0.60, 0.00, 1.00, 1.0),
+    (1.00, 0.30, 0.60, 1.0),
+    (0.40, 0.80, 0.20, 1.0),
+    (0.30, 0.30, 0.30, 1.0),
+    (0.70, 0.70, 0.70, 1.0),
+    (0.00, 0.60, 0.40, 1.0),
+    (0.80, 0.20, 0.00, 1.0),
+    (0.20, 0.00, 0.60, 1.0),
 ]
-
 
 
 def ensure_runtime_dirs() -> None:

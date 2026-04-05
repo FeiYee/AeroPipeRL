@@ -99,6 +99,37 @@ MAX_TRAIN_EPISODES = 200000
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# 可视化配置
+W = 1280
+H = 800
+WATCH_SPF = 1         # 每渲染帧运行的环境步数（观看模式）
+WATCH_PAUSE = 80      # 观看模式下两局之间的暂停帧数
+
+# Agent颜色调色板 (RGBA 0-1)
+AGENT_COLORS = [
+    (0.10, 0.90, 1.00, 1.0),   # cyan
+    (1.00, 0.55, 0.05, 1.0),   # orange
+    (0.20, 1.00, 0.35, 1.0),   # green
+    (0.90, 0.20, 1.00, 1.0),   # purple
+    (1.00, 0.20, 0.20, 1.0),   # red
+    (0.20, 0.40, 1.00, 1.0),   # blue
+    (1.00, 0.90, 0.20, 1.0),   # yellow
+    (0.00, 0.80, 0.80, 1.0),   # teal
+    (0.80, 0.40, 0.00, 1.0),   # brown
+    (1.00, 0.00, 0.70, 1.0),   # magenta
+    (0.50, 1.00, 0.00, 1.0),   # lime
+    (0.00, 0.50, 1.00, 1.0),   # sky blue
+    (0.60, 0.00, 1.00, 1.0),   # violet
+    (1.00, 0.30, 0.60, 1.0),   # pink
+    (0.40, 0.80, 0.20, 1.0),   # olive green
+    (0.30, 0.30, 0.30, 1.0),   # dark gray
+    (0.70, 0.70, 0.70, 1.0),   # light gray
+    (0.00, 0.60, 0.40, 1.0),   # sea green
+    (0.80, 0.20, 0.00, 1.0),   # dark orange-red
+    (0.20, 0.00, 0.60, 1.0),   # indigo
+]
+
+
 
 def ensure_runtime_dirs() -> None:
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)

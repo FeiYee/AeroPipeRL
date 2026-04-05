@@ -27,6 +27,10 @@ from aeropipe_rl.config import (
     N_LAYERS,
     SAVE_EVERY_EP,
     T_HORIZON,
+    TIMEOUT_PENALTY_PER_STEP,
+    DEVIATION_PENALTY_PER_STEP,
+    OVERDUE_REPLAN_PENALTY,
+    SUBGOAL_CHECK_INTERVAL,
     ensure_runtime_dirs,
 )
 from aeropipe_rl.environment import MAEnv, PipeNet
@@ -190,6 +194,35 @@ def main(argv: list[str] | None = None) -> None:
             ep_start=ep_start,
         )
         next_obs, rewards, dones, results = env.step(step_out["actions"])
+
+        # ========== 新增：子目标超时/偏离惩罚 ==========
+        n = env.n_agents
+        trainer.subgoal_elapsed_steps[:n] += 1
+        for i in range(n):
+            if trainer.has_active_option[i] and not dones[i]:
+                # 超时惩罚
+                if trainer.subgoal_elapsed_steps[i] > trainer.subgoal_deadline[i]:
+                    rewards[i] -= TIMEOUT_PENALTY_PER_STEP
+                # 偏离惩罚：ego状态前3维是位置
+                current_pos = egos[i][:3]
+                subgoal_pos = trainer.active_subgoal_pos[i]
+                dist = np.linalg.norm(current_pos - subgoal_pos)
+                if dist > trainer.subgoal_tolerance[i]:
+                    rewards[i] -= DEVIATION_PENALTY_PER_STEP
+                    trainer.pending_replan[i] = True
+                    rewards[i] -= OVERDUE_REPLAN_PENALTY  # 偏离触发重规划额外惩罚
+        # ============================================
+
+        # ========== 新增：高层主动检查子目标进度 ==========
+        if tr_ep_steps % SUBGOAL_CHECK_INTERVAL == 0:
+            for i in range(n):
+                if trainer.has_active_option[i] and not dones[i]:
+                    progress = trainer.subgoal_elapsed_steps[i] / max(trainer.subgoal_deadline[i], 1.0)
+                    # 进度超过2倍deadline还没到，主动重规划
+                    if progress > 2.0:
+                        trainer.pending_replan[i] = True
+                        rewards[i] -= OVERDUE_REPLAN_PENALTY
+        # ============================================
 
         tr_ep_r += rewards.sum()
         tr_ep_steps += 1

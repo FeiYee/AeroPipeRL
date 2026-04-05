@@ -16,6 +16,8 @@ from aeropipe_rl.config import (
     N_HEADS,
     NODE_DIM,
     TIME_WINDOW_SIZE,
+    ENABLE_GLOBAL_COLLISION_PENALTY,
+    FLOW_PENALTY_COEF,
 )
 
 
@@ -111,6 +113,20 @@ class PlannerActor(nn.Module):
         edge_flow_scores = self.edge_flow_head(edge_input).squeeze(-1)
 
         valid_edges = (adj.unsqueeze(1) > 0)
+
+        # ========== 新增：全局流量约束，避免多智能体路径冲突 ==========
+        if ENABLE_GLOBAL_COLLISION_PENALTY and existing_route_onehot is not None:
+            batch_size, agent_count = existing_route_onehot.shape[:2]
+            # 计算每个节点的全局占用率（所有智能体已选路径的节点概率之和）
+            node_occupancy = existing_route_onehot.sum(dim=1)  # [batch, MAX_N_NODES]
+            # 扩展维度到和edge_flow_scores匹配：[batch, agent_count, MAX_N_NODES, MAX_N_NODES]
+            # src_occupancy是每个边起点的占用率：[batch, agent_count, src_node, dst_node]
+            src_occupancy = node_occupancy.unsqueeze(1).unsqueeze(-1).expand(-1, agent_count, -1, MAX_N_NODES)
+            edge_occupancy = src_occupancy * adj.unsqueeze(1)  # 邻接矩阵是有向的，仅保留存在的边
+            # 占用越多的边，分数越低，引导智能体选择空闲路径
+            edge_flow_scores = edge_flow_scores - FLOW_PENALTY_COEF * edge_occupancy
+        # ============================================================
+
         edge_flow_scores = edge_flow_scores.masked_fill(~valid_edges, -1e4)
         flow_out = self.flow_layer(
             edge_flow_scores.view(batch_size, agent_count, MAX_N_EDGES),
@@ -137,6 +153,15 @@ class PlannerActor(nn.Module):
         speed_ref = torch.tanh(aux_out[..., TIME_WINDOW_SIZE]) * MAX_SPEED
         wait_prob = torch.sigmoid(aux_out[..., TIME_WINDOW_SIZE + 1])
 
+        # ========== 新增：子目标约束参数 ==========
+        # 子目标预计到达时间（步）：speed_ref越大，deadline越短
+        subgoal_deadline = torch.clamp(speed_ref * 20.0, min=20.0, max=200.0)
+        # 子目标优先级：0-1，越高越优先
+        subgoal_priority = torch.sigmoid(time_slot_logits.mean(dim=-1))
+        # 允许偏离最大距离（米）：3-5米
+        subgoal_tolerance = 3.0 + 2.0 * torch.sigmoid(wait_prob)
+        # ==========================================
+
         return {
             "edge_flow_weights": edge_flow_scores.view(batch_size, agent_count, MAX_N_EDGES),
             "edge_path_probs": flow_out["edge_path_probs"],
@@ -145,6 +170,9 @@ class PlannerActor(nn.Module):
             "subgoal_node_probs": subgoal_node_probs,
             "subgoal_position": subgoal_position,
             "subgoal_token": subgoal_token,
+            "subgoal_deadline": subgoal_deadline,  # 新增
+            "subgoal_priority": subgoal_priority,  # 新增
+            "subgoal_tolerance": subgoal_tolerance,  # 新增
             "time_slot_logits": time_slot_logits,
             "speed_ref": speed_ref,
             "wait_prob": wait_prob,

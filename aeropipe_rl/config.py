@@ -9,7 +9,7 @@ CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 LATEST_CKPT_PATH = CHECKPOINT_DIR / "pipe_marl_latest.pt"
 BEST_CKPT_PATH = CHECKPOINT_DIR / "pipe_marl_best.pt"
 
-N_AGENTS = 6                  # FIX: 20 agents in a 26-node graph is severely overcrowded
+N_AGENTS = 20                  # FIX: 20 agents in a 26-node graph is severely overcrowded
                                # ~0.77 agents/node causes constant collisions & reward explosion
                                # 6 agents gives room to learn, scale up later
 MAX_N_NODES = 26
@@ -73,7 +73,7 @@ ENT_COEF = 0.025              # FIX: was 0.015, more exploration early
 VAL_COEF = 0.50
 GRAD_NORM = 0.40              # FIX: was 0.50, tighter gradient clipping
 MAX_EP_STEPS = 500
-STEP_BUDGET = 0               # 0 = auto-compute per episode
+STEP_BUDGET = 300               # 0 = auto-compute per episode
 
 # ── Reward shaping ───────────────────────────────────────────────────────────
 # FIX: This was the reward explosion source.
@@ -118,6 +118,17 @@ SAVE_EVERY_EP = 100
 MAX_TRAIN_EPISODES = 200_000
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ── 新增：全局路径协同优化配置 ─────────────────────────────────────────────────────
+ENABLE_GLOBAL_COLLISION_PENALTY = True
+FLOW_PENALTY_COEF = 10.0       # 边占用惩罚系数，越高分流效果越强
+CONFLICT_LOSS_COEF = 0.1       # 全局冲突正则项系数
+
+# ── 新增：高低层目标对齐配置 ─────────────────────────────────────────────────────
+TIMEOUT_PENALTY_PER_STEP = 0.1   # 子目标超时每步惩罚
+DEVIATION_PENALTY_PER_STEP = 0.2 # 子目标偏离每步惩罚
+OVERDUE_REPLAN_PENALTY = 1.0     # 偏离触发重规划一次性惩罚
+SUBGOAL_CHECK_INTERVAL = 50      # 高层主动检查子目标进度的步长间隔
 
 # GUI / watch mode defaults
 W = 1280

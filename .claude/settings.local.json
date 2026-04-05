@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py -3.10 main.py --max-episodes 1)",
+      "Bash(py -3.10 main.py --max-episodes 5)"
+    ]
+  }
+}

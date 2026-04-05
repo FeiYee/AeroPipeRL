@@ -33,6 +33,8 @@ from aeropipe_rl.config import (
     PLANNER_GAMMA,
     TERMINATION_THRESHOLD,
     VAL_COEF,
+    ENABLE_GLOBAL_COLLISION_PENALTY,
+    CONFLICT_LOSS_COEF,
 )
 from aeropipe_rl.models.policy import MARLPolicy
 from aeropipe_rl.training.buffer import RolloutBuffer
@@ -76,6 +78,12 @@ class MAPPOTrainer:
         self.active_subgoal_node = np.zeros(N_AGENTS, dtype=np.int64)
         self.has_active_option = np.zeros(N_AGENTS, dtype=bool)
         self.pending_replan = np.ones(N_AGENTS, dtype=bool)
+        # ========== 新增：子目标约束参数存储 ==========
+        self.subgoal_deadline = np.zeros(N_AGENTS, dtype=np.float32)
+        self.subgoal_priority = np.zeros(N_AGENTS, dtype=np.float32)
+        self.subgoal_tolerance = np.zeros(N_AGENTS, dtype=np.float32)
+        self.subgoal_elapsed_steps = np.zeros(N_AGENTS, dtype=np.int32)
+        # ============================================
 
     def set_n_agents(self, n: int) -> None:
         """Curriculum: update active agent count. Resets per-agent state."""
@@ -85,6 +93,12 @@ class MAPPOTrainer:
         self.active_subgoal_node = np.zeros(N_AGENTS, dtype=np.int64)
         self.has_active_option = np.zeros(N_AGENTS, dtype=bool)
         self.pending_replan = np.ones(N_AGENTS, dtype=bool)
+        # ========== 新增：子目标约束参数重置 ==========
+        self.subgoal_deadline = np.zeros(N_AGENTS, dtype=np.float32)
+        self.subgoal_priority = np.zeros(N_AGENTS, dtype=np.float32)
+        self.subgoal_tolerance = np.zeros(N_AGENTS, dtype=np.float32)
+        self.subgoal_elapsed_steps = np.zeros(N_AGENTS, dtype=np.int32)
+        # ============================================
 
     def reset_episode(self) -> None:
         self.policy.executor.reset_temporal()
@@ -93,6 +107,12 @@ class MAPPOTrainer:
         self.active_subgoal_node.fill(0)
         self.has_active_option[:] = False
         self.pending_replan[:] = True
+        # ========== 新增：子目标约束参数重置 ==========
+        self.subgoal_deadline.fill(0.0)
+        self.subgoal_priority.fill(0.0)
+        self.subgoal_tolerance.fill(0.0)
+        self.subgoal_elapsed_steps.fill(0)
+        # ============================================
 
     def after_step(self, dones: np.ndarray) -> None:
         done_mask = np.asarray(dones, dtype=bool)
@@ -102,6 +122,12 @@ class MAPPOTrainer:
         self.active_subgoal_pos[:n][done_mask] = 0.0
         self.active_subgoal_token[:n][done_mask] = 0.0
         self.active_subgoal_node[:n][done_mask] = 0
+        # ========== 新增：完成的智能体重置子目标约束 ==========
+        self.subgoal_deadline[:n][done_mask] = 0.0
+        self.subgoal_priority[:n][done_mask] = 0.0
+        self.subgoal_tolerance[:n][done_mask] = 0.0
+        self.subgoal_elapsed_steps[:n][done_mask] = 0
+        # ============================================
 
     def _critic_global_from_egos(self, egos, dones_mask=None, n_agents=None):
         """
@@ -236,12 +262,22 @@ class MAPPOTrainer:
             transition_np = planner_out["transition_probs"].squeeze(0).cpu().numpy()
             route_gain = np.zeros(n, dtype=np.float32)
 
+            subgoal_deadline_np = planner_out["subgoal_deadline"].squeeze(0).cpu().numpy()
+            subgoal_priority_np = planner_out["subgoal_priority"].squeeze(0).cpu().numpy()
+            subgoal_tolerance_np = planner_out["subgoal_tolerance"].squeeze(0).cpu().numpy()
+
             for agent_id in np.where(planner_active_mask)[0]:
                 planner_action[agent_id] = int(sampled_nodes_np[agent_id])
                 planner_log_prob[agent_id] = float(sampled_lp_np[agent_id])
                 self.active_subgoal_node[agent_id] = planner_action[agent_id]
                 self.active_subgoal_pos[agent_id] = subgoal_pos_np[agent_id]
                 self.active_subgoal_token[agent_id] = subgoal_tok_np[agent_id]
+                # ========== 新增：存储子目标约束参数 ==========
+                self.subgoal_deadline[agent_id] = float(subgoal_deadline_np[agent_id])
+                self.subgoal_priority[agent_id] = float(subgoal_priority_np[agent_id])
+                self.subgoal_tolerance[agent_id] = float(subgoal_tolerance_np[agent_id])
+                self.subgoal_elapsed_steps[agent_id] = 0  # 重置计时
+                # ============================================
                 route_gain[agent_id] = env.apply_flow_subgoal(
                     agent_id,
                     transition_np[agent_id],
@@ -520,7 +556,7 @@ class MAPPOTrainer:
                 bPlanMask = torch.FloatTensor(planner_mask_n[b]).to(DEVICE)
                 bPlanADV = torch.FloatTensor(planner_adv[:, :cur_n][b]).to(DEVICE)
 
-                _, plan_lp, plan_ent = self.policy.planner.evaluate_action(
+                outputs, plan_lp, plan_ent = self.policy.planner.evaluate_action(
                     bPNF, bPEF, bE, bPADJ, bPCUR, bPGOAL, bPA,
                     existing_route_onehot=bPROUTE,
                     plan_mask=bPlanMaskBool,
@@ -531,6 +567,17 @@ class MAPPOTrainer:
                 p2 = ratio_plan.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * bPlanADV
                 planner_loss = (-torch.min(p1, p2) - 0.5 * self._ent_coef * plan_ent) * bPlanMask
                 planner_loss = planner_loss.sum() / (bPlanMask.sum() + 1e-8)
+
+                # ========== 新增：全局路径冲突正则项 ==========
+                if ENABLE_GLOBAL_COLLISION_PENALTY and float(bPlanMask.sum().item()) > 0.0:
+                    edge_path_probs = outputs["edge_path_probs"]  # [batch, agent_count, MAX_N_EDGES]
+                    # 计算路径重叠率：sum(所有智能体边概率之和的平方)，重叠越多值越大
+                    route_overlap = torch.sum(torch.square(torch.sum(edge_path_probs, dim=1)), dim=-1)
+                    # 归一化除以智能体数量，保证损失量级和主损失匹配
+                    route_overlap = route_overlap / edge_path_probs.shape[1]
+                    conflict_loss = CONFLICT_LOSS_COEF * torch.mean(route_overlap)
+                    planner_loss = planner_loss + conflict_loss
+                # ==============================================
 
                 if float(bPlanMask.sum().item()) > 0.0:
                     self.opt_planner.zero_grad()

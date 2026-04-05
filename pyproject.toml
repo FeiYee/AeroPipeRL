@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aeropiperl"
+version = "0.1.0"
+authors = [
+  { name="FeiYee", email="feiyee@example.com" }
+]
+description = "Multi-agent UAV pipe-network navigation with reinforcement learning"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "torch>=2.0",
+  "pygame>=2.5",
+  "PyOpenGL>=3.1",
+  "PyOpenGL_accelerate>=3.1",
+]
+
+[project.scripts]
+aeropipe-watch = "scripts.watch_model:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aeropipe_rl*"]

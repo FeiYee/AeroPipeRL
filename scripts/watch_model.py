@@ -97,11 +97,13 @@ def main():
                 if wa_done_all:
                     break
                 egos, node_feats, adjs, nbrs, nbr_masks, g_obs = wa_obs
-                acts, _, _, _, _, _ = trainer.act(
+                act_output = trainer.act(
                     egos, node_feats, adjs, nbrs, nbr_masks, g_obs, env,
                     agent_mask=env.dones.copy(),
                     deterministic=True)
-                wa_attn_cache = trainer.policy.executor.graph_attn_weights()
+                acts = act_output["actions"]
+                # 暂时禁用注意力可视化，避免接口不兼容
+                wa_attn_cache = None
 
                 wa_obs, _, dones, results = env.step(acts)
                 wa_positions = env.positions.copy()

@@ -1,0 +1,2 @@
+[console_scripts]
+aeropipe-watch = scripts.watch_model:main

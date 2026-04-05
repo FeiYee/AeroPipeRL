@@ -54,15 +54,31 @@ class Camera:
 class HUD:
     """2D heads-up display for rendering status information."""
     def __init__(self):
-        self.font = pygame.font.SysFont('Consolas', 16)
+        self.font = None
+        self.font_available = False
+        try:
+            # 尝试加载字体，失败则禁用HUD文本显示
+            self.font = pygame.font.SysFont(None, 16)
+            self.font_available = True
+        except Exception:
+            # 字体加载失败时静默处理，不显示文本
+            pass
 
     def render_text(self, text, x, y, color=(1.0, 1.0, 1.0)):
-        text_surface = self.font.render(text, True, (int(color[0]*255), int(color[1]*255), int(color[2]*255)))
-        text_data = pygame.image.tostring(text_surface, "RGBA", True)
-        glWindowPos2i(x, y)
-        glDrawPixels(text_surface.get_width(), text_surface.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, text_data)
+        if not self.font_available:
+            return
+        try:
+            text_surface = self.font.render(text, True, (int(color[0]*255), int(color[1]*255), int(color[2]*255)))
+            text_data = pygame.image.tostring(text_surface, "RGBA", True)
+            glWindowPos2i(x, y)
+            glDrawPixels(text_surface.get_width(), text_surface.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, text_data)
+        except Exception:
+            # 渲染失败时静默跳过
+            pass
 
     def render(self, trainer, mode, env, last_results):
+        if not self.font_available:
+            return
         # 切换到正交投影渲染2D内容
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()

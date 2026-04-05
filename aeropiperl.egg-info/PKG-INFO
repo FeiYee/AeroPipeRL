@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: aeropiperl
+Version: 0.1.0
+Summary: Multi-agent UAV pipe-network navigation with reinforcement learning
+Author-email: FeiYee <feiyee@example.com>
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.24
+Requires-Dist: torch>=2.0
+Requires-Dist: pygame>=2.5
+Requires-Dist: PyOpenGL>=3.1
+Requires-Dist: PyOpenGL_accelerate>=3.1

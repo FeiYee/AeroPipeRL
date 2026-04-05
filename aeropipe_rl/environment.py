@@ -598,6 +598,104 @@ class MAEnv:
         global_obs = np.concatenate(egos).astype(np.float32)
         return egos, node_feats, adjs, nbrs, nbr_masks, global_obs
 
+    def _route_plan_onehot(self, id_map: dict[int, int]) -> np.ndarray:
+        route_onehot = np.zeros((N_AGENTS, MAX_N_NODES), dtype=np.float32)
+        for agent_id, path in enumerate(self.route_plan):
+            if self.dones[agent_id]:
+                continue
+            for node_id in path:
+                if node_id in id_map:
+                    route_onehot[agent_id, id_map[node_id]] = 1.0
+        return route_onehot
+
+    def flow_efficiency_score(self) -> float:
+        traffic_edges = self._compute_traffic_edge_features()
+        if not traffic_edges:
+            return 0.0
+
+        loads = np.array([feat[0] for feat in traffic_edges.values()], dtype=np.float32)
+        conflicts = np.array([feat[1] for feat in traffic_edges.values()], dtype=np.float32)
+        speeds = np.array([feat[3] for feat in traffic_edges.values()], dtype=np.float32)
+
+        active_agents = np.where(~self.dones)[0]
+        if len(active_agents) == 0:
+            progress = 1.0
+        else:
+            goal_dists = [
+                float(np.linalg.norm(self.positions[idx] - self.goals[idx]) / max(self.net.extent, 1e-6))
+                for idx in active_agents
+            ]
+            progress = 1.0 - float(np.mean(goal_dists))
+
+        flow_score = (
+            0.45 * progress
+            + 0.30 * float(np.mean(speeds)) * 0.5
+            + 0.25 * (1.0 - 0.5 * (float(np.mean(loads)) + float(np.mean(conflicts))))
+        )
+        return float(np.clip(flow_score, -1.0, 1.0))
+
+    def get_planner_state(self) -> dict[str, np.ndarray]:
+        node_ids = sorted(self.net.nodes.keys())
+        node_count = len(node_ids)
+        id_map = {nid: idx for idx, nid in enumerate(node_ids)}
+
+        node_feat = np.zeros((MAX_N_NODES, NODE_DIM), dtype=np.float32)
+        node_mask = np.zeros(MAX_N_NODES, dtype=bool)
+        padded_node_ids = np.full(MAX_N_NODES, -1, dtype=np.int64)
+
+        for idx, node_id in enumerate(node_ids):
+            node_mask[idx] = True
+            padded_node_ids[idx] = node_id
+            pos = self.net.nodes[node_id]
+            node_feat[idx, :3] = pos / self.net.extent
+            min_dist = 1e18
+            for agent_id in range(N_AGENTS):
+                if not self.dones[agent_id]:
+                    min_dist = min(min_dist, float(np.linalg.norm(pos - self.goals[agent_id])))
+            node_feat[idx, 3] = min_dist / self.net.extent
+            occupancy = 0
+            for agent_id in range(N_AGENTS):
+                if not self.dones[agent_id] and self._nearest_node_id(self.positions[agent_id]) == node_id:
+                    occupancy += 1
+            node_feat[idx, 4] = np.clip(occupancy / max(N_AGENTS, 1), 0.0, 1.0)
+
+        edge_feats = np.zeros((MAX_N_NODES, MAX_N_NODES, 4), dtype=np.float32)
+        traffic_edges = self._compute_traffic_edge_features()
+        for (src, dst), feat in traffic_edges.items():
+            if src in id_map and dst in id_map:
+                edge_feats[id_map[src], id_map[dst]] = feat
+
+        adj = np.eye(MAX_N_NODES, dtype=np.float32)
+        for src, neighbors in self.net.adj.items():
+            for dst in neighbors:
+                if src in id_map and dst in id_map:
+                    adj[id_map[src], id_map[dst]] = 1.0
+                    adj[id_map[dst], id_map[src]] = 1.0
+
+        agent_ego_feats = []
+        traffic_edges = self._compute_traffic_edge_features()
+        for agent_id in range(N_AGENTS):
+            ego, _, _, _, _ = self._obs_agent(agent_id, traffic_edges)
+            agent_ego_feats.append(ego)
+
+        cur_node_ids = np.zeros(N_AGENTS, dtype=np.int64)
+        goal_node_ids = np.zeros(N_AGENTS, dtype=np.int64)
+        for agent_id in range(N_AGENTS):
+            cur_node_ids[agent_id] = id_map.get(self._nearest_node_id(self.positions[agent_id]), 0)
+            goal_node_ids[agent_id] = id_map.get(self.goal_nodes[agent_id], 0)
+
+        return {
+            "node_feat": node_feat,
+            "edge_feat": edge_feats,
+            "agent_ego_feats": np.stack(agent_ego_feats).astype(np.float32),
+            "adj": adj,
+            "node_mask": node_mask,
+            "node_ids": padded_node_ids,
+            "cur_node_ids": cur_node_ids,
+            "goal_node_ids": goal_node_ids,
+            "route_onehot": self._route_plan_onehot(id_map),
+        }
+
     def _obs_agent(self, agent_id: int, traffic_edges: Dict[Tuple[int, int], np.ndarray]):
         pos = self.positions[agent_id]
         vel = self.prev_vels[agent_id]
@@ -700,46 +798,111 @@ class MAEnv:
         self._edge_feature_cache = smoothed
         return smoothed
 
+    def _decode_flow_path(
+        self,
+        transition_probs: np.ndarray,
+        start_idx: int,
+        goal_idx: int,
+        node_ids: np.ndarray,
+    ) -> list[int]:
+        idx_to_node = {idx: int(node_id) for idx, node_id in enumerate(node_ids) if node_id >= 0}
+        node_to_idx = {node_id: idx for idx, node_id in idx_to_node.items()}
+        if start_idx not in idx_to_node or goal_idx not in idx_to_node:
+            return []
+
+        path_idx = [start_idx]
+        visited = {start_idx}
+        cur_idx = start_idx
+        max_hops = max(len(idx_to_node) + 2, 4)
+
+        for _ in range(max_hops):
+            if cur_idx == goal_idx:
+                break
+            cur_node = idx_to_node[cur_idx]
+            neighbor_idx = [node_to_idx[nbr] for nbr in self.net.adj[cur_node] if nbr in node_to_idx]
+            if not neighbor_idx:
+                break
+
+            ranked = sorted(
+                neighbor_idx,
+                key=lambda idx: float(transition_probs[cur_idx, idx]),
+                reverse=True,
+            )
+            next_idx = None
+            for cand_idx in ranked:
+                if cand_idx == goal_idx or cand_idx not in visited:
+                    next_idx = cand_idx
+                    break
+            if next_idx is None:
+                next_idx = ranked[0]
+
+            path_idx.append(next_idx)
+            if next_idx == goal_idx:
+                break
+            if next_idx in visited:
+                break
+            visited.add(next_idx)
+            cur_idx = next_idx
+
+        actual_path = [idx_to_node[idx] for idx in path_idx]
+        if actual_path[-1] != idx_to_node[goal_idx]:
+            fallback = self.net.bfs(actual_path[-1], idx_to_node[goal_idx])
+            if fallback and len(fallback) > 1:
+                actual_path.extend(fallback[1:])
+        return actual_path
+
+    def apply_flow_subgoal(
+        self,
+        agent_id: int,
+        transition_probs: np.ndarray,
+        subgoal_idx: int,
+        node_ids: np.ndarray,
+    ) -> float:
+        idx_to_node = {idx: int(node_id) for idx, node_id in enumerate(node_ids) if node_id >= 0}
+        node_to_idx = {node_id: idx for idx, node_id in idx_to_node.items()}
+        cur_node = self._nearest_node_id(self.positions[agent_id])
+        goal_node = self.goal_nodes[agent_id]
+
+        if cur_node not in node_to_idx or goal_node not in node_to_idx or subgoal_idx not in idx_to_node:
+            fallback = self.net.bfs(cur_node, goal_node) or [cur_node]
+            self.route_plan[agent_id] = fallback
+            self.waypoints[agent_id] = [self.net.nodes[node].copy() for node in fallback]
+            self.wp_idx[agent_id] = min(1, len(fallback) - 1)
+            return 0.0
+
+        cur_idx = node_to_idx[cur_node]
+        goal_idx = node_to_idx[goal_node]
+        path_to_subgoal = self._decode_flow_path(transition_probs, cur_idx, subgoal_idx, node_ids)
+        subgoal_node = idx_to_node[subgoal_idx]
+        path_to_goal = self._decode_flow_path(transition_probs, node_to_idx.get(subgoal_node, goal_idx), goal_idx, node_ids)
+
+        if not path_to_subgoal:
+            full_path = self.net.bfs(cur_node, goal_node) or [cur_node]
+        else:
+            full_path = path_to_subgoal
+            if path_to_goal:
+                full_path = full_path + path_to_goal[1:]
+
+        if full_path[-1] != goal_node:
+            fallback = self.net.bfs(full_path[-1], goal_node)
+            if fallback and len(fallback) > 1:
+                full_path = full_path + fallback[1:]
+
+        if len(full_path) < 2:
+            full_path = self.net.bfs(cur_node, goal_node) or [cur_node]
+
+        old_len = max(len(self.route_plan[agent_id]), 1)
+        new_len = max(len(full_path), 1)
+        len_gain = (old_len - new_len) / float(old_len)
+
+        self.route_plan[agent_id] = full_path
+        self.waypoints[agent_id] = [self.net.nodes[node].copy() for node in full_path]
+        self.wp_idx[agent_id] = min(1, len(full_path) - 1)
+        return float(len_gain)
+
     def _get_global_planner_state(self):
-        node_ids = sorted(self.net.nodes.keys())
-        node_count = len(node_ids)
-        id_map = {nid: idx for idx, nid in enumerate(node_ids)}
-
-        node_feat = np.zeros((node_count, NODE_DIM), dtype=np.float32)
-        for idx, node_id in enumerate(node_ids):
-            pos = self.net.nodes[node_id]
-            node_feat[idx, :3] = pos / self.net.extent
-            min_dist = 1e18
-            for agent_id in range(N_AGENTS):
-                if not self.dones[agent_id]:
-                    min_dist = min(min_dist, float(np.linalg.norm(pos - self.goals[agent_id])))
-            node_feat[idx, 3] = min_dist / self.net.extent
-            occupancy = 0
-            for agent_id in range(N_AGENTS):
-                if not self.dones[agent_id] and self._nearest_node_id(self.positions[agent_id]) == node_id:
-                    occupancy += 1
-            node_feat[idx, 4] = np.clip(occupancy / max(N_AGENTS, 1), 0.0, 1.0)
-
-        edge_feats = np.zeros((node_count, node_count, 4), dtype=np.float32)
-        traffic_edges = self._compute_traffic_edge_features()
-        for (src, dst), feat in traffic_edges.items():
-            if src in id_map and dst in id_map:
-                edge_feats[id_map[src], id_map[dst]] = feat
-
-        adj = np.zeros((node_count, node_count), dtype=np.float32)
-        for src, neighbors in self.net.adj.items():
-            for dst in neighbors:
-                if src in id_map and dst in id_map:
-                    adj[id_map[src], id_map[dst]] = 1.0
-                    adj[id_map[dst], id_map[src]] = 1.0
-
-        agent_ego_feats = []
-        traffic_edges = self._compute_traffic_edge_features()
-        for agent_id in range(N_AGENTS):
-            ego, _, _, _, _ = self._obs_agent(agent_id, traffic_edges)
-            agent_ego_feats.append(ego)
-
-        return node_feat, edge_feats, np.stack(agent_ego_feats), adj, id_map
+        state = self.get_planner_state()
+        return state["node_feat"], state["edge_feat"], state["agent_ego_feats"], state["adj"], state["node_ids"]
 
     def _build_local_graph_obs(self, agent_id: int, traffic_edges: Dict[Tuple[int, int], np.ndarray]):
         pos = self.positions[agent_id]

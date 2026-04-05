@@ -16,18 +16,20 @@ from aeropipe_rl.config import (
     ENABLE_COMM,
     ENT_COEF,
     EGO_DIM,
-    GAMMA,
-    GAE_LAMBDA,
     GRAD_NORM,
-    HIGH_LEVEL_UPDATE_FREQ,
+    HIDDEN,
     K_EPOCHS,
+    LOW_LEVEL_GAE_LAMBDA,
+    LOW_LEVEL_GAMMA,
     LR_ACTOR,
     LR_CRITIC,
     MINI_BATCH,
     N_AGENTS,
-    R_CAPACITY,
-    R_CONFLICT,
-    R_ON_TIME,
+    OPTION_GAE_LAMBDA,
+    OPTION_GAMMA,
+    PLANNER_GAE_LAMBDA,
+    PLANNER_GAMMA,
+    TERMINATION_THRESHOLD,
     VAL_COEF,
 )
 from aeropipe_rl.models.policy import MARLPolicy
@@ -42,7 +44,6 @@ class MAPPOTrainer:
         self.opt_adversary = optim.Adam(self.policy.adversary.parameters(), lr=LR_ACTOR * 0.3)
         self.opt_c = optim.Adam(self.policy.critic.parameters(), lr=LR_CRITIC)
         self.buf = RolloutBuffer()
-        self.high_level_step_counter = 0
 
         self.ep = 0
         self.total_t = 0
@@ -66,6 +67,28 @@ class MAPPOTrainer:
         self.best_score = -1e9
         self._ent_coef = ENT_COEF
 
+        self.active_subgoal_pos = np.zeros((N_AGENTS, 3), dtype=np.float32)
+        self.active_subgoal_token = np.zeros((N_AGENTS, HIDDEN), dtype=np.float32)
+        self.active_subgoal_node = np.zeros(N_AGENTS, dtype=np.int64)
+        self.has_active_option = np.zeros(N_AGENTS, dtype=bool)
+        self.pending_replan = np.ones(N_AGENTS, dtype=bool)
+
+    def reset_episode(self) -> None:
+        self.policy.executor.reset_temporal()
+        self.active_subgoal_pos.fill(0.0)
+        self.active_subgoal_token.fill(0.0)
+        self.active_subgoal_node.fill(0)
+        self.has_active_option[:] = False
+        self.pending_replan[:] = True
+
+    def after_step(self, dones: np.ndarray) -> None:
+        done_mask = np.asarray(dones, dtype=bool)
+        self.pending_replan[done_mask] = False
+        self.has_active_option[done_mask] = False
+        self.active_subgoal_pos[done_mask] = 0.0
+        self.active_subgoal_token[done_mask] = 0.0
+        self.active_subgoal_node[done_mask] = 0
+
     def _critic_global_from_egos(self, egos, dones_mask=None):
         global_obs = np.concatenate(egos).astype(np.float32)
         if dones_mask is not None:
@@ -76,8 +99,60 @@ class MAPPOTrainer:
                     global_obs[start : start + EGO_DIM] = 0.0
         return global_obs
 
+    def _normalize_advantages(self, adv: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        valid = mask > 0.5
+        if not np.any(valid):
+            return adv
+        mean = float(np.mean(adv[valid]))
+        std = float(np.std(adv[valid]) + 1e-6)
+        out = adv.copy()
+        out[valid] = (out[valid] - mean) / std
+        return out
+
+    def _compute_gae(
+        self,
+        rewards: np.ndarray,
+        values: np.ndarray,
+        active_masks: np.ndarray,
+        terminal_mask: np.ndarray,
+        ep_start: np.ndarray,
+        last_value: np.ndarray,
+        gamma: float,
+        gae_lambda: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        rollout_len = rewards.shape[0]
+        adv = np.zeros_like(rewards)
+        ret = np.zeros_like(rewards)
+        gae = np.zeros(rewards.shape[1], dtype=np.float32)
+        v_next = last_value.copy()
+
+        for t in reversed(range(rollout_len)):
+            if t + 1 < rollout_len and bool(ep_start[t + 1]):
+                gae[:] = 0.0
+                v_next[:] = 0.0
+            terminal = terminal_mask[t].astype(np.float32)
+            delta = rewards[t] + gamma * v_next * (1.0 - terminal) - values[t]
+            gae = delta + gamma * gae_lambda * (1.0 - terminal) * gae
+            gae *= active_masks[t]
+            adv[t] = gae
+            ret[t] = gae + values[t]
+            v_next = values[t]
+        return adv, ret
+
     @torch.no_grad()
-    def act(self, egos, node_feats, adjs, nbrs_list, nbr_masks, global_obs, env, agent_mask=None, deterministic=False):
+    def act(
+        self,
+        egos,
+        node_feats,
+        adjs,
+        nbrs_list,
+        nbr_masks,
+        global_obs,
+        env,
+        agent_mask=None,
+        deterministic=False,
+        ep_start=False,
+    ):
         if agent_mask is None:
             agent_mask = np.zeros(N_AGENTS, dtype=bool)
 
@@ -89,64 +164,132 @@ class MAPPOTrainer:
         agent_mask_tensor = torch.BoolTensor(agent_mask).unsqueeze(0).to(DEVICE)
         global_tensor = torch.FloatTensor(global_obs).unsqueeze(0).to(DEVICE)
 
-        actions, log_probs = self.policy.executor.get_action(
+        critic_heads = self.policy.critic(global_tensor, head="all")
+        step_value = np.full(N_AGENTS, float(critic_heads["step"].item()), dtype=np.float32)
+        option_value = np.full(N_AGENTS, float(critic_heads["option"].item()), dtype=np.float32)
+        planner_value = np.full(N_AGENTS, float(critic_heads["planner"].item()), dtype=np.float32)
+        step_value[agent_mask] = 0.0
+        option_value[agent_mask] = 0.0
+        planner_value[agent_mask] = 0.0
+
+        option_start = self.pending_replan & (~agent_mask)
+        planner_action = np.zeros(N_AGENTS, dtype=np.int64)
+        planner_log_prob = np.zeros(N_AGENTS, dtype=np.float32)
+        planner_reward = np.zeros(N_AGENTS, dtype=np.float32)
+        planner_active_mask = option_start.copy()
+
+        planner_state = env.get_planner_state()
+        planner_node_tensor = torch.FloatTensor(planner_state["node_feat"]).unsqueeze(0).to(DEVICE)
+        planner_edge_tensor = torch.FloatTensor(planner_state["edge_feat"]).unsqueeze(0).to(DEVICE)
+        planner_adj_tensor = torch.FloatTensor(planner_state["adj"]).unsqueeze(0).to(DEVICE)
+        planner_node_mask_tensor = torch.BoolTensor(planner_state["node_mask"]).unsqueeze(0).to(DEVICE)
+        planner_cur_nodes_tensor = torch.LongTensor(planner_state["cur_node_ids"]).unsqueeze(0).to(DEVICE)
+        planner_goal_nodes_tensor = torch.LongTensor(planner_state["goal_node_ids"]).unsqueeze(0).to(DEVICE)
+        planner_route_tensor = torch.FloatTensor(planner_state["route_onehot"]).unsqueeze(0).to(DEVICE)
+        plan_mask_tensor = torch.BoolTensor(option_start).unsqueeze(0).to(DEVICE)
+
+        if np.any(planner_active_mask):
+            planner_out = self.policy.planner(
+                planner_node_tensor,
+                planner_edge_tensor,
+                ego_tensor,
+                planner_adj_tensor,
+                planner_cur_nodes_tensor,
+                planner_goal_nodes_tensor,
+                existing_route_onehot=planner_route_tensor,
+                plan_mask=plan_mask_tensor,
+                node_mask=planner_node_mask_tensor,
+            )
+            planner_dist = torch.distributions.Categorical(planner_out["subgoal_node_probs"])
+            if deterministic:
+                sampled_nodes = planner_out["subgoal_node_probs"].argmax(dim=-1)
+            else:
+                sampled_nodes = planner_dist.sample()
+            sampled_lp = planner_dist.log_prob(sampled_nodes)
+
+            sampled_nodes_np = sampled_nodes.squeeze(0).cpu().numpy()
+            sampled_lp_np = sampled_lp.squeeze(0).cpu().numpy()
+            subgoal_pos_np = planner_out["subgoal_position"].squeeze(0).cpu().numpy()
+            subgoal_tok_np = planner_out["subgoal_token"].squeeze(0).cpu().numpy()
+            transition_np = planner_out["transition_probs"].squeeze(0).cpu().numpy()
+            route_gain = np.zeros(N_AGENTS, dtype=np.float32)
+
+            for agent_id in np.where(planner_active_mask)[0]:
+                planner_action[agent_id] = int(sampled_nodes_np[agent_id])
+                planner_log_prob[agent_id] = float(sampled_lp_np[agent_id])
+                self.active_subgoal_node[agent_id] = planner_action[agent_id]
+                self.active_subgoal_pos[agent_id] = subgoal_pos_np[agent_id]
+                self.active_subgoal_token[agent_id] = subgoal_tok_np[agent_id]
+                route_gain[agent_id] = env.apply_flow_subgoal(
+                    agent_id,
+                    transition_np[agent_id],
+                    planner_action[agent_id],
+                    planner_state["node_ids"],
+                )
+                self.has_active_option[agent_id] = True
+            planner_reward[planner_active_mask] = env.flow_efficiency_score() + route_gain[planner_active_mask]
+
+        subgoal_pos_tensor = torch.FloatTensor(self.active_subgoal_pos).unsqueeze(0).to(DEVICE)
+        subgoal_tok_tensor = torch.FloatTensor(self.active_subgoal_token).unsqueeze(0).to(DEVICE)
+        option_start_tensor = torch.BoolTensor(option_start).unsqueeze(0).to(DEVICE)
+        actions, action_log_probs, terminate_action, terminate_log_prob, terminate_prob = self.policy.executor.sample_policy(
             ego_tensor,
             node_tensor,
             adj_tensor,
             nbr_tensor,
             nbr_mask_tensor,
+            subgoal_pos=subgoal_pos_tensor,
+            subgoal_token=subgoal_tok_tensor,
             agent_mask=agent_mask_tensor,
+            option_start=option_start_tensor,
             deterministic=deterministic,
-            ep_start=False,
+            ep_start=ep_start,
             training_mode=False,
         )
-        value = self.policy.critic(global_tensor)
 
-        planner_next_node = np.zeros(N_AGENTS, dtype=np.int32)
-        planner_log_prob = np.zeros(N_AGENTS, dtype=np.float32)
-        planner_reward = np.zeros(N_AGENTS, dtype=np.float32)
-
-        if self.high_level_step_counter % HIGH_LEVEL_UPDATE_FREQ == 0:
-            global_node_feat, global_edge_feat, _, global_adj, _ = env._get_global_planner_state()
-            cur_node_ids = [env._nearest_node_id(env.positions[i]) for i in range(N_AGENTS)]
-            cur_node_tensor = torch.LongTensor(cur_node_ids).unsqueeze(0).to(DEVICE)
-            next_node_logits, _, _, _ = self.policy.planner(
-                torch.FloatTensor(global_node_feat).unsqueeze(0).to(DEVICE),
-                torch.FloatTensor(global_edge_feat).unsqueeze(0).to(DEVICE),
-                ego_tensor,
-                torch.FloatTensor(global_adj).unsqueeze(0).to(DEVICE),
-                cur_node_tensor,
-            )
-            next_node_probs = torch.softmax(next_node_logits, dim=-1)
-            next_node_dist = torch.distributions.Categorical(next_node_probs)
-            if deterministic:
-                planner_next_node = next_node_probs.argmax(dim=-1).squeeze(0).cpu().numpy()
-            else:
-                planner_next_node = next_node_dist.sample().squeeze(0).cpu().numpy()
-            planner_log_prob = next_node_dist.log_prob(torch.LongTensor(planner_next_node).to(DEVICE)).squeeze(0).cpu().numpy()
-
-            for i in range(N_AGENTS):
-                if agent_mask[i]:
-                    continue
-                cur_node = cur_node_ids[i]
-                next_node = planner_next_node[i]
-                if next_node in env.net.adj[cur_node] and next_node != env.goal_nodes[i]:
-                    new_path = env.net.bfs(cur_node, env.goal_nodes[i])
-                    if new_path:
-                        env.route_plan[i] = [cur_node] + new_path[1:]
-                        env.waypoints[i] = [env.net.nodes[nid].copy() for nid in env.route_plan[i]]
-                        env.wp_idx[i] = 1
-                        planner_reward[i] += R_ON_TIME + R_CAPACITY + max(R_CONFLICT, 0.0)
-
-        self.high_level_step_counter += 1
+        termination_active_mask = self.has_active_option & (~option_start) & (~agent_mask)
+        terminate_prob_np = terminate_prob.squeeze(0).cpu().numpy()
+        terminate_action_np = terminate_prob_np >= TERMINATION_THRESHOLD
+        terminate_log_prob_np = np.where(
+            terminate_action_np,
+            np.log(np.clip(terminate_prob_np, 1e-6, 1.0)),
+            np.log(np.clip(1.0 - terminate_prob_np, 1e-6, 1.0)),
+        ).astype(np.float32)
+        terminate_action_np[~termination_active_mask] = False
+        terminate_log_prob_np[~termination_active_mask] = 0.0
+        terminate_prob_np[~termination_active_mask] = 0.0
+        self.pending_replan = terminate_action_np & termination_active_mask
 
         act_np = actions.squeeze(0).cpu().numpy()
-        lp_np = log_probs.squeeze(0).cpu().numpy() if log_probs is not None else np.zeros(N_AGENTS, dtype=np.float32)
-        val_np = np.full(N_AGENTS, float(value.item()), dtype=np.float32)
+        action_log_prob_np = action_log_probs.squeeze(0).cpu().numpy()
         act_np[agent_mask] = 0.0
-        lp_np[agent_mask] = 0.0
-        val_np[agent_mask] = 0.0
-        return act_np, lp_np, val_np, planner_next_node, planner_log_prob, planner_reward
+        action_log_prob_np[agent_mask] = 0.0
+
+        return {
+            "actions": act_np,
+            "action_log_probs": action_log_prob_np,
+            "step_values": step_value,
+            "option_values": option_value,
+            "planner_values": planner_value,
+            "subgoal_positions": self.active_subgoal_pos.copy(),
+            "subgoal_tokens": self.active_subgoal_token.copy(),
+            "option_start": option_start.copy(),
+            "termination_actions": terminate_action_np,
+            "termination_log_probs": terminate_log_prob_np,
+            "termination_probs": terminate_prob_np,
+            "termination_active_masks": termination_active_mask.copy(),
+            "planner_node_feats": planner_state["node_feat"].copy(),
+            "planner_edge_feats": planner_state["edge_feat"].copy(),
+            "planner_adjs": planner_state["adj"].copy(),
+            "planner_node_masks": planner_state["node_mask"].copy(),
+            "planner_cur_nodes": planner_state["cur_node_ids"].copy(),
+            "planner_goal_nodes": planner_state["goal_node_ids"].copy(),
+            "planner_route_onehot": planner_state["route_onehot"].copy(),
+            "planner_actions": planner_action,
+            "planner_log_probs": planner_log_prob,
+            "planner_rewards": planner_reward,
+            "planner_active_masks": planner_active_mask,
+        }
 
     def update(self, last_egos, last_dones) -> None:
         rollout_len = len(self.buf)
@@ -156,31 +299,67 @@ class MAPPOTrainer:
         with torch.no_grad():
             clean_last_g = self._critic_global_from_egos(last_egos, dones_mask=last_dones)
             global_tensor = torch.FloatTensor(clean_last_g).unsqueeze(0).to(DEVICE)
-            last_v = np.full(N_AGENTS, float(self.policy.critic(global_tensor).item()), dtype=np.float32)
-        last_v = last_v * (~last_dones).astype(np.float32)
+            last_heads = self.policy.critic(global_tensor, head="all")
+            last_step_v = np.full(N_AGENTS, float(last_heads["step"].item()), dtype=np.float32)
+            last_option_v = np.full(N_AGENTS, float(last_heads["option"].item()), dtype=np.float32)
+            last_planner_v = np.full(N_AGENTS, float(last_heads["planner"].item()), dtype=np.float32)
+        alive_mask = (~last_dones).astype(np.float32)
+        last_step_v *= alive_mask
+        last_option_v *= alive_mask
+        last_planner_v *= alive_mask
 
         rewards = np.array(self.buf.rewards, dtype=np.float32)
         dones = np.array(self.buf.dones, dtype=np.float32)
         masks = np.array(self.buf.active_masks, dtype=np.float32)
-        values = np.array(self.buf.values, dtype=np.float32)
         ep_start = np.array(self.buf.ep_start, dtype=bool)
-        dones = np.maximum(dones, 1.0 - masks)
-        rewards = rewards * masks
-        values = values * masks
 
-        adv = np.zeros_like(rewards)
-        ret = np.zeros_like(rewards)
-        gae = np.zeros(N_AGENTS, dtype=np.float32)
-        v_next = last_v
-        for t in reversed(range(rollout_len)):
-            if t + 1 < rollout_len and ep_start[t + 1]:
-                gae[:] = 0.0
-                v_next[:] = 0.0
-            delta = rewards[t] + GAMMA * v_next * (1 - dones[t]) - values[t]
-            gae = delta + GAMMA * GAE_LAMBDA * (1 - dones[t]) * gae
-            adv[t] = gae
-            ret[t] = gae + values[t]
-            v_next = values[t]
+        step_values = np.array(self.buf.step_values, dtype=np.float32) * masks
+        option_values = np.array(self.buf.option_values, dtype=np.float32) * masks
+        planner_values = np.array(self.buf.planner_values, dtype=np.float32) * masks
+
+        step_terminal = np.maximum(dones, 1.0 - masks)
+        option_terminal = np.maximum(np.array(self.buf.option_end, dtype=np.float32), 1.0 - masks)
+        planner_rewards = np.array(self.buf.planner_rewards, dtype=np.float32) * np.array(
+            self.buf.planner_active_masks,
+            dtype=np.float32,
+        )
+
+        step_adv, step_ret = self._compute_gae(
+            rewards,
+            step_values,
+            masks,
+            step_terminal,
+            ep_start,
+            last_step_v,
+            LOW_LEVEL_GAMMA,
+            LOW_LEVEL_GAE_LAMBDA,
+        )
+        option_adv, option_ret = self._compute_gae(
+            rewards,
+            option_values,
+            masks,
+            option_terminal,
+            ep_start,
+            last_option_v,
+            OPTION_GAMMA,
+            OPTION_GAE_LAMBDA,
+        )
+        planner_adv, planner_ret = self._compute_gae(
+            planner_rewards,
+            planner_values,
+            masks,
+            step_terminal,
+            ep_start,
+            last_planner_v,
+            PLANNER_GAMMA,
+            PLANNER_GAE_LAMBDA,
+        )
+
+        term_mask_t = np.array(self.buf.termination_active_masks, dtype=np.float32)
+        planner_mask_t = np.array(self.buf.planner_active_masks, dtype=np.float32)
+        step_adv = self._normalize_advantages(step_adv, masks)
+        option_adv = self._normalize_advantages(option_adv, term_mask_t)
+        planner_adv = self._normalize_advantages(planner_adv, planner_mask_t)
 
         ego_t = np.array(self.buf.egos, dtype=np.float32)
         node_t = np.array(self.buf.node_feats, dtype=np.float32)
@@ -189,10 +368,24 @@ class MAPPOTrainer:
         nbr_mask_t = np.array(self.buf.nbr_masks, dtype=bool)
         global_t = np.array(self.buf.globals, dtype=np.float32)
         act_t = np.array(self.buf.actions, dtype=np.float32)
-        log_prob_t = np.array(self.buf.log_probs, dtype=np.float32)
-        mask_t = np.array(self.buf.active_masks, dtype=np.float32)
+        act_lp_t = np.array(self.buf.action_log_probs, dtype=np.float32)
+        subgoal_pos_t = np.array(self.buf.subgoal_positions, dtype=np.float32)
+        subgoal_token_t = np.array(self.buf.subgoal_tokens, dtype=np.float32)
+        option_start_t = np.array(self.buf.option_start, dtype=bool)
+        term_action_t = np.array(self.buf.termination_actions, dtype=np.float32)
+        term_lp_t = np.array(self.buf.termination_log_probs, dtype=np.float32)
 
-        valid_t = np.any(mask_t > 0.5, axis=1)
+        planner_node_t = np.array(self.buf.planner_node_feats, dtype=np.float32)
+        planner_edge_t = np.array(self.buf.planner_edge_feats, dtype=np.float32)
+        planner_adj_t = np.array(self.buf.planner_adjs, dtype=np.float32)
+        planner_node_mask_t = np.array(self.buf.planner_node_masks, dtype=bool)
+        planner_cur_t = np.array(self.buf.planner_cur_nodes, dtype=np.int64)
+        planner_goal_t = np.array(self.buf.planner_goal_nodes, dtype=np.int64)
+        planner_route_t = np.array(self.buf.planner_route_onehot, dtype=np.float32)
+        planner_action_t = np.array(self.buf.planner_actions, dtype=np.int64)
+        planner_lp_t = np.array(self.buf.planner_log_probs, dtype=np.float32)
+
+        valid_t = np.any(masks > 0.5, axis=1)
         idxs = np.where(valid_t)[0]
         if len(idxs) == 0:
             self.buf.clear()
@@ -225,54 +418,122 @@ class MAPPOTrainer:
             np.random.shuffle(chunks)
             for start, end in chunks:
                 b = np.arange(start, end, dtype=np.int64)
+
                 bE = torch.FloatTensor(ego_t[b]).to(DEVICE)
                 bNF = torch.FloatTensor(node_t[b]).to(DEVICE)
                 bADJ = torch.FloatTensor(adj_t[b]).to(DEVICE)
                 bNB = torch.FloatTensor(nbr_t[b]).to(DEVICE)
                 bNM = torch.BoolTensor(nbr_mask_t[b]).to(DEVICE)
-                bG = torch.FloatTensor(global_t[b]).to(DEVICE)
+                bSGP = torch.FloatTensor(subgoal_pos_t[b]).to(DEVICE)
+                bSGT = torch.FloatTensor(subgoal_token_t[b]).to(DEVICE)
                 bA = torch.FloatTensor(act_t[b]).to(DEVICE)
-                bLP = torch.FloatTensor(log_prob_t[b]).to(DEVICE)
-                bADV = torch.FloatTensor(adv[b]).to(DEVICE)
-                bRET = torch.FloatTensor(ret[b]).to(DEVICE)
-                bM = torch.FloatTensor(mask_t[b]).to(DEVICE)
+                bOldLP = torch.FloatTensor(act_lp_t[b]).to(DEVICE)
+                bStepADV = torch.FloatTensor(step_adv[b]).to(DEVICE)
+                bOptionADV = torch.FloatTensor(option_adv[b]).to(DEVICE)
+                bStepRET = torch.FloatTensor(step_ret[b]).to(DEVICE)
+                bOptionRET = torch.FloatTensor(option_ret[b]).to(DEVICE)
+                bPlannerRET = torch.FloatTensor(planner_ret[b]).to(DEVICE)
+                bM = torch.FloatTensor(masks[b]).to(DEVICE)
                 bAM = bM < 0.5
+                bOS = torch.BoolTensor(option_start_t[b]).to(DEVICE)
+                bEP = torch.BoolTensor(ep_start[b]).to(DEVICE)
 
-                new_lp, entropy = self.policy.executor.evaluate_action(
+                bTA = torch.FloatTensor(term_action_t[b]).to(DEVICE)
+                bOldTermLP = torch.FloatTensor(term_lp_t[b]).to(DEVICE)
+                bTM = torch.FloatTensor(term_mask_t[b]).to(DEVICE)
+
+                action_lp, action_ent, term_lp, term_ent = self.policy.executor.evaluate_policy(
                     bE,
                     bNF,
                     bADJ,
                     bNB,
                     bNM,
                     bA,
+                    bTA,
+                    subgoal_pos=bSGP,
+                    subgoal_token=bSGT,
                     agent_mask=bAM,
-                    ep_start=True,
+                    option_start=bOS,
+                    ep_start=bEP,
                     training_mode=True,
                 )
-                new_v = self.policy.critic(bG)
 
-                ratio = (new_lp - bLP).exp() * bM
-                s1 = ratio * bADV
-                s2 = ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * bADV
-                actor_loss = (-torch.min(s1, s2) * bM - self._ent_coef * entropy * bM).sum() / (bM.sum() + 1e-8)
+                ratio_action = (action_lp - bOldLP).exp() * bM
+                s1 = ratio_action * bStepADV
+                s2 = ratio_action.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * bStepADV
+                action_loss = (-torch.min(s1, s2) - self._ent_coef * action_ent) * bM
+                action_loss = action_loss.sum() / (bM.sum() + 1e-8)
 
-                ret_mean = (bRET * bM).sum(-1) / bM.sum(-1).clamp(min=1.0)
-                critic_loss = VAL_COEF * nn.functional.mse_loss(new_v, ret_mean)
+                ratio_term = (term_lp - bOldTermLP).exp() * bTM
+                t1 = ratio_term * bOptionADV
+                t2 = ratio_term.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * bOptionADV
+                term_loss = (-torch.min(t1, t2) - 0.5 * self._ent_coef * term_ent) * bTM
+                term_loss = term_loss.sum() / (bTM.sum() + 1e-8)
 
                 self.opt_exec.zero_grad()
-                actor_loss.backward()
+                exec_loss = action_loss + term_loss
+                exec_loss.backward()
                 nn.utils.clip_grad_norm_(self.policy.executor.parameters(), GRAD_NORM)
                 self.opt_exec.step()
+
+                bPNF = torch.FloatTensor(planner_node_t[b]).to(DEVICE)
+                bPEF = torch.FloatTensor(planner_edge_t[b]).to(DEVICE)
+                bPADJ = torch.FloatTensor(planner_adj_t[b]).to(DEVICE)
+                bPNM = torch.BoolTensor(planner_node_mask_t[b]).to(DEVICE)
+                bPCUR = torch.LongTensor(planner_cur_t[b]).to(DEVICE)
+                bPGOAL = torch.LongTensor(planner_goal_t[b]).to(DEVICE)
+                bPROUTE = torch.FloatTensor(planner_route_t[b]).to(DEVICE)
+                bPA = torch.LongTensor(planner_action_t[b]).to(DEVICE)
+                bOldPlanLP = torch.FloatTensor(planner_lp_t[b]).to(DEVICE)
+                bPlanMaskBool = torch.BoolTensor(planner_mask_t[b] > 0.5).to(DEVICE)
+                bPlanMask = torch.FloatTensor(planner_mask_t[b]).to(DEVICE)
+                bPlanADV = torch.FloatTensor(planner_adv[b]).to(DEVICE)
+
+                _, plan_lp, plan_ent = self.policy.planner.evaluate_action(
+                    bPNF,
+                    bPEF,
+                    bE,
+                    bPADJ,
+                    bPCUR,
+                    bPGOAL,
+                    bPA,
+                    existing_route_onehot=bPROUTE,
+                    plan_mask=bPlanMaskBool,
+                    node_mask=bPNM,
+                )
+                ratio_plan = (plan_lp - bOldPlanLP).exp() * bPlanMask
+                p1 = ratio_plan * bPlanADV
+                p2 = ratio_plan.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * bPlanADV
+                planner_loss = (-torch.min(p1, p2) - 0.5 * self._ent_coef * plan_ent) * bPlanMask
+                planner_loss = planner_loss.sum() / (bPlanMask.sum() + 1e-8)
+
+                if float(bPlanMask.sum().item()) > 0.0:
+                    self.opt_planner.zero_grad()
+                    planner_loss.backward()
+                    nn.utils.clip_grad_norm_(self.policy.planner.parameters(), GRAD_NORM)
+                    self.opt_planner.step()
+
+                bG = torch.FloatTensor(global_t[b]).to(DEVICE)
+                critic_heads = self.policy.critic(bG, head="all")
+                active_den = bM.sum(dim=-1).clamp(min=1.0)
+                step_target = (bStepRET * bM).sum(dim=-1) / active_den
+                option_target = (bOptionRET * bM).sum(dim=-1) / active_den
+                planner_target = (bPlannerRET * bM).sum(dim=-1) / active_den
+                critic_loss = VAL_COEF * (
+                    nn.functional.mse_loss(critic_heads["step"], step_target)
+                    + nn.functional.mse_loss(critic_heads["option"], option_target)
+                    + nn.functional.mse_loss(critic_heads["planner"], planner_target)
+                )
 
                 self.opt_c.zero_grad()
                 critic_loss.backward()
                 nn.utils.clip_grad_norm_(self.policy.critic.parameters(), GRAD_NORM)
                 self.opt_c.step()
 
-                actor_losses.append(actor_loss.item())
+                actor_losses.append(float((exec_loss + planner_loss).item()))
 
-        self.loss_hist.append(np.mean(actor_losses))
-        self.total_t += int(np.sum(mask_t))
+        self.loss_hist.append(np.mean(actor_losses) if actor_losses else 0.0)
+        self.total_t += int(np.sum(masks))
         self.buf.clear()
         self.update_cnt += 1
 
@@ -285,6 +546,8 @@ class MAPPOTrainer:
         self._ent_coef = max(0.003, ENT_COEF * (0.9995 ** self.update_cnt))
         if self.update_cnt % 100 == 0:
             for param_group in self.opt_exec.param_groups:
+                param_group["lr"] *= 0.997
+            for param_group in self.opt_planner.param_groups:
                 param_group["lr"] *= 0.997
             for param_group in self.opt_c.param_groups:
                 param_group["lr"] *= 0.997

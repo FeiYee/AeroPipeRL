@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from aeropipe_rl.algorithms.hierarchy import SubgoalFiLM, TerminationLIF
 from aeropipe_rl.config import (
     ACT_DIM,
     COMM_ALPHA_INIT,
@@ -195,6 +196,28 @@ class BetaActor(nn.Module):
         self.graph_encoder = LocalGraphEncoder()
         self.ego_mlp = nn.Sequential(nn.Linear(EGO_DIM, HIDDEN), nn.ReLU(), nn.Linear(HIDDEN, HIDDEN))
         self.nbr_mlp = nn.Sequential(nn.Linear(NBR_DIM, HIDDEN // 2), nn.ReLU(), nn.Linear(HIDDEN // 2, HIDDEN // 2))
+        self.subgoal_pos_encoder = nn.Sequential(
+            nn.Linear(10, HIDDEN),
+            nn.GELU(),
+            nn.Linear(HIDDEN, HIDDEN),
+        )
+        self.goal_condition_proj = nn.Sequential(
+            nn.Linear(HIDDEN * 2, HIDDEN),
+            nn.GELU(),
+            nn.Linear(HIDDEN, HIDDEN),
+        )
+        film_channels = {
+            "node_input": NODE_DIM,
+            "graph_output": HIDDEN,
+            "ego_input": EGO_DIM,
+            "ego_output": HIDDEN,
+            "local_input": HIDDEN + HIDDEN + HIDDEN // 2,
+            "local_output": HIDDEN,
+        }
+        for layer_idx in range(N_LAYERS):
+            film_channels[f"comm_pre_{layer_idx}"] = HIDDEN
+            film_channels[f"comm_post_{layer_idx}"] = HIDDEN
+        self.subgoal_film = SubgoalFiLM(film_channels)
         self.local_fuse = nn.Sequential(
             nn.Linear(HIDDEN + HIDDEN + HIDDEN // 2, HIDDEN),
             nn.ReLU(),
@@ -206,15 +229,20 @@ class BetaActor(nn.Module):
         )
         self.temporal_gru = nn.GRUCell(HIDDEN, HIDDEN // 2)
         self._h = None
+        self._termination_v = None
+        self._prev_subgoal_dist = None
         self.post_fuse = nn.Sequential(nn.Linear(HIDDEN + HIDDEN // 2, HIDDEN // 2), nn.Tanh())
+        self.termination_lif = TerminationLIF(ctx_dim=HIDDEN // 2, metric_dim=5)
         self.head = nn.Sequential(nn.Linear(HIDDEN // 2, ACT_DIM * 2), nn.Softplus())
         self.eps = 1e-6
         self.comm_alpha = COMM_ALPHA_INIT
 
     def reset_temporal(self) -> None:
         self._h = None
+        self._termination_v = None
+        self._prev_subgoal_dist = None
 
-    def _ensure_step_batch(self, ego, node_feat, adj, nbrs, nbr_mask, agent_mask):
+    def _ensure_step_batch(self, ego, node_feat, adj, nbrs, nbr_mask, subgoal_pos, subgoal_token, agent_mask, option_start):
         added_batch = False
         if ego.dim() == 2:
             added_batch = True
@@ -223,24 +251,103 @@ class BetaActor(nn.Module):
             adj = adj.unsqueeze(0)
             nbrs = nbrs.unsqueeze(0)
             nbr_mask = nbr_mask.unsqueeze(0)
+            subgoal_pos = subgoal_pos.unsqueeze(0) if subgoal_pos is not None else None
+            subgoal_token = subgoal_token.unsqueeze(0) if subgoal_token is not None else None
             if agent_mask is not None and agent_mask.dim() == 1:
                 agent_mask = agent_mask.unsqueeze(0)
-        return ego, node_feat, adj, nbrs, nbr_mask, agent_mask, added_batch
+            if option_start is not None and option_start.dim() == 1:
+                option_start = option_start.unsqueeze(0)
+        return ego, node_feat, adj, nbrs, nbr_mask, subgoal_pos, subgoal_token, agent_mask, option_start, added_batch
 
-    def _encode(self, ego, node_feat, adj, nbrs, nbr_mask, agent_mask=None, ep_start=False, training_mode=False):
-        ego, node_feat, adj, nbrs, nbr_mask, agent_mask, added_batch = self._ensure_step_batch(
-            ego, node_feat, adj, nbrs, nbr_mask, agent_mask
+    def _expand_ep_start(self, ep_start, batch_size: int, agent_count: int, device: torch.device) -> torch.Tensor:
+        if isinstance(ep_start, bool):
+            ep_tensor = torch.full((batch_size, agent_count), ep_start, dtype=torch.bool, device=device)
+        elif isinstance(ep_start, torch.Tensor):
+            ep_tensor = ep_start.to(device=device, dtype=torch.bool)
+            if ep_tensor.dim() == 0:
+                ep_tensor = ep_tensor.view(1, 1).expand(batch_size, agent_count)
+            elif ep_tensor.dim() == 1:
+                ep_tensor = ep_tensor.unsqueeze(-1).expand(-1, agent_count)
+        else:
+            ep_tensor = torch.zeros((batch_size, agent_count), dtype=torch.bool, device=device)
+        return ep_tensor
+
+    def _build_goal_condition(self, ego, subgoal_pos, subgoal_token):
+        ego_pos = ego[..., :3]
+        ego_vel = ego[..., 3:6]
+        if subgoal_pos is None:
+            subgoal_pos = torch.zeros(*ego.shape[:-1], 3, device=ego.device, dtype=ego.dtype)
+        if subgoal_token is None:
+            subgoal_token = torch.zeros(*ego.shape[:-1], HIDDEN, device=ego.device, dtype=ego.dtype)
+
+        delta = subgoal_pos - ego_pos
+        subgoal_dist = torch.linalg.norm(delta, dim=-1)
+        subgoal_dir = delta / subgoal_dist.unsqueeze(-1).clamp(min=1e-6)
+        speed_norm = torch.linalg.norm(ego_vel, dim=-1).clamp(min=1e-6)
+        align = (ego_vel * subgoal_dir).sum(dim=-1) / speed_norm
+        geometry = ego[..., 14:16]
+
+        goal_pos_features = torch.cat(
+            [
+                subgoal_pos,
+                subgoal_dir,
+                subgoal_dist.unsqueeze(-1),
+                align.unsqueeze(-1),
+                geometry,
+            ],
+            dim=-1,
+        )
+        pos_token = self.subgoal_pos_encoder(goal_pos_features)
+        goal_condition = self.goal_condition_proj(torch.cat([subgoal_token, pos_token], dim=-1))
+        static_metrics = torch.cat([align.unsqueeze(-1), geometry], dim=-1)
+        return goal_condition, subgoal_dist, static_metrics
+
+    def _encode(
+        self,
+        ego,
+        node_feat,
+        adj,
+        nbrs,
+        nbr_mask,
+        subgoal_pos=None,
+        subgoal_token=None,
+        agent_mask=None,
+        option_start=None,
+        ep_start=False,
+        training_mode=False,
+    ):
+        ego, node_feat, adj, nbrs, nbr_mask, subgoal_pos, subgoal_token, agent_mask, option_start, added_batch = self._ensure_step_batch(
+            ego,
+            node_feat,
+            adj,
+            nbrs,
+            nbr_mask,
+            subgoal_pos,
+            subgoal_token,
+            agent_mask,
+            option_start,
         )
 
         batch_size, agent_count = ego.shape[:2]
+        if agent_mask is None:
+            agent_mask = torch.zeros((batch_size, agent_count), dtype=torch.bool, device=ego.device)
+        if option_start is None:
+            option_start = torch.zeros((batch_size, agent_count), dtype=torch.bool, device=ego.device)
+
+        goal_condition, subgoal_dist, static_metrics = self._build_goal_condition(ego, subgoal_pos, subgoal_token)
         ego_flat = ego.reshape(batch_size * agent_count, EGO_DIM)
         node_flat = node_feat.reshape(batch_size * agent_count, LOCAL_TOPK, NODE_DIM)
         adj_flat = adj.reshape(batch_size * agent_count, LOCAL_TOPK, LOCAL_TOPK)
         nbr_flat = nbrs.reshape(batch_size * agent_count, MAX_NBR, NBR_DIM)
         nbr_mask_flat = nbr_mask.reshape(batch_size * agent_count, MAX_NBR)
+        goal_flat = goal_condition.reshape(batch_size * agent_count, HIDDEN)
 
+        node_flat = self.subgoal_film.apply("node_input", node_flat, goal_flat)
         graph_nodes = self.graph_encoder(node_flat, adj_flat)
-        cur_weights = node_flat[..., 6:7]
+        graph_nodes = self.subgoal_film.apply("graph_output", graph_nodes, goal_flat)
+        cur_weights = node_flat[..., 5:6]
+        goal_weights = node_flat[..., 6:7]
+        cur_weights = cur_weights + 0.5 * goal_weights
         cur_den = cur_weights.sum(dim=1, keepdim=True) + 1e-6
         graph_ctx = (graph_nodes * cur_weights).sum(dim=1) / cur_den.squeeze(1)
 
@@ -249,105 +356,235 @@ class BetaActor(nn.Module):
         nbr_ctx = nbr_h.max(dim=1).values
         nbr_ctx = torch.where(torch.isinf(nbr_ctx), torch.zeros_like(nbr_ctx), nbr_ctx)
 
+        ego_flat = self.subgoal_film.apply("ego_input", ego_flat, goal_flat)
         ego_ctx = self.ego_mlp(ego_flat)
-        local_ctx = self.local_fuse(torch.cat([ego_ctx, graph_ctx, nbr_ctx], dim=-1)).view(batch_size, agent_count, HIDDEN)
-
-        if agent_mask is None:
-            agent_mask = torch.zeros((batch_size, agent_count), dtype=torch.bool, device=ego.device)
+        ego_ctx = self.subgoal_film.apply("ego_output", ego_ctx, goal_flat)
+        local_input = torch.cat([ego_ctx, graph_ctx, nbr_ctx], dim=-1)
+        local_input = self.subgoal_film.apply("local_input", local_input, goal_flat)
+        local_ctx = self.local_fuse(local_input).view(batch_size, agent_count, HIDDEN)
+        local_ctx = self.subgoal_film.apply("local_output", local_ctx, goal_condition)
 
         if ENABLE_COMM and len(self.comm_blocks) > 0:
             comm_ctx = local_ctx
-            for block in self.comm_blocks:
+            for layer_idx, block in enumerate(self.comm_blocks):
+                comm_ctx = self.subgoal_film.apply(f"comm_pre_{layer_idx}", comm_ctx, goal_condition)
                 comm_ctx = block(comm_ctx, key_padding_mask=agent_mask)
+                comm_ctx = self.subgoal_film.apply(f"comm_post_{layer_idx}", comm_ctx, goal_condition)
             alpha = float(np.clip(getattr(self, "comm_alpha", COMM_ALPHA_INIT), 0.0, COMM_ALPHA_MAX))
             ctx_full = local_ctx + alpha * (comm_ctx - local_ctx)
         else:
             ctx_full = local_ctx
 
-        if training_mode:
-            h_view = torch.zeros(batch_size, agent_count, HIDDEN // 2, device=ego.device, dtype=ctx_full.dtype)
+        ep_start_mask = self._expand_ep_start(ep_start, batch_size, agent_count, ego.device)
+        state_reset = ep_start_mask | option_start
+
+        if (
+            training_mode
+            or self._h is None
+            or self._termination_v is None
+            or self._prev_subgoal_dist is None
+            or self._h.shape[0] != agent_count
+        ):
+            h_state = torch.zeros(agent_count, HIDDEN // 2, device=ego.device, dtype=ctx_full.dtype)
+            term_v = torch.zeros(agent_count, 1, device=ego.device, dtype=ctx_full.dtype)
+            prev_dist = subgoal_dist[0].detach()
         else:
-            flat = ctx_full.reshape(batch_size * agent_count, HIDDEN)
-            need_reset = (self._h is None) or bool(ep_start) or (self._h.shape[0] != batch_size * agent_count)
-            if need_reset:
-                self._h = torch.zeros(batch_size * agent_count, HIDDEN // 2, device=ego.device, dtype=flat.dtype)
-            else:
-                self._h = self._h.to(device=ego.device, dtype=flat.dtype)
+            h_state = self._h.to(device=ego.device, dtype=ctx_full.dtype)
+            term_v = self._termination_v.to(device=ego.device, dtype=ctx_full.dtype)
+            prev_dist = self._prev_subgoal_dist.to(device=ego.device, dtype=subgoal_dist.dtype)
 
-            h_new = self.temporal_gru(flat, self._h)
-            am_flat = agent_mask.reshape(batch_size * agent_count, 1).expand_as(h_new)
-            h_new = torch.where(am_flat, self._h, h_new)
-            active_flat = (~agent_mask).reshape(batch_size * agent_count, 1).expand_as(h_new)
-            noise = 0.01 * torch.randn_like(h_new)
-            h_new = torch.where(active_flat, h_new + noise, h_new)
-            self._h = h_new.detach()
-            h_view = h_new.reshape(batch_size, agent_count, HIDDEN // 2)
+        h_steps = []
+        for t in range(batch_size):
+            reset_t = state_reset[t]
+            h_state = torch.where(reset_t.unsqueeze(-1), torch.zeros_like(h_state), h_state)
+            h_prev = h_state
+            h_state = self.temporal_gru(ctx_full[t], h_state)
+            h_state = torch.where(agent_mask[t].unsqueeze(-1), h_prev, h_state)
+            if not training_mode:
+                active_t = (~agent_mask[t]).unsqueeze(-1).expand_as(h_state)
+                h_state = torch.where(active_t, h_state + 0.01 * torch.randn_like(h_state), h_state)
+            h_steps.append(h_state)
 
+        h_view = torch.stack(h_steps, dim=0)
         ctx = self.post_fuse(torch.cat([ctx_full, h_view], dim=-1))
         ctx = ctx.masked_fill(agent_mask.unsqueeze(-1), 0.0)
+
+        term_probs = []
+        for t in range(batch_size):
+            reset_t = state_reset[t]
+            prev_dist = torch.where(reset_t, subgoal_dist[t].detach(), prev_dist)
+            progress = (prev_dist - subgoal_dist[t]).unsqueeze(-1)
+            term_metrics = torch.cat([subgoal_dist[t].unsqueeze(-1), progress, static_metrics[t]], dim=-1)
+            term_prob_t, _, term_v = self.termination_lif(
+                ctx[t],
+                term_metrics,
+                membrane=term_v,
+                reset_mask=reset_t,
+                agent_mask=agent_mask[t],
+            )
+            prev_dist = torch.where(agent_mask[t], prev_dist, subgoal_dist[t].detach())
+            term_probs.append(term_prob_t)
+        terminate_prob = torch.stack(term_probs, dim=0)
+
+        if not training_mode:
+            self._h = h_state.detach()
+            self._termination_v = term_v.detach()
+            self._prev_subgoal_dist = prev_dist.detach()
+
         if added_batch:
             ctx = ctx.squeeze(0)
-        return ctx
+            terminate_prob = terminate_prob.squeeze(0)
+        return ctx, terminate_prob
 
-    def forward(self, ego, node_feat, adj, nbrs, nbr_mask, agent_mask=None, ep_start=False, training_mode=False):
-        ctx = self._encode(
+    def forward(
+        self,
+        ego,
+        node_feat,
+        adj,
+        nbrs,
+        nbr_mask,
+        subgoal_pos=None,
+        subgoal_token=None,
+        agent_mask=None,
+        option_start=None,
+        ep_start=False,
+        training_mode=False,
+    ):
+        ctx, terminate_prob = self._encode(
             ego,
             node_feat,
             adj,
             nbrs,
             nbr_mask,
+            subgoal_pos=subgoal_pos,
+            subgoal_token=subgoal_token,
             agent_mask=agent_mask,
+            option_start=option_start,
             ep_start=ep_start,
             training_mode=training_mode,
         )
         params = self.head(ctx).reshape(*ctx.shape[:-1], ACT_DIM, 2) + self.eps
-        return params[..., 0], params[..., 1]
+        return params[..., 0], params[..., 1], terminate_prob
 
-    def get_action(self, ego, node_feat, adj, nbrs, nbr_mask, agent_mask=None, deterministic=False, ep_start=False, training_mode=False):
-        alpha, beta = self.forward(
+    def sample_policy(
+        self,
+        ego,
+        node_feat,
+        adj,
+        nbrs,
+        nbr_mask,
+        subgoal_pos=None,
+        subgoal_token=None,
+        agent_mask=None,
+        option_start=None,
+        deterministic=False,
+        ep_start=False,
+        training_mode=False,
+    ):
+        alpha, beta, terminate_prob = self.forward(
             ego,
             node_feat,
             adj,
             nbrs,
             nbr_mask,
+            subgoal_pos=subgoal_pos,
+            subgoal_token=subgoal_token,
             agent_mask=agent_mask,
+            option_start=option_start,
             ep_start=ep_start,
             training_mode=training_mode,
         )
         dist = torch.distributions.Beta(alpha, beta)
         if deterministic:
             sample = alpha / (alpha + beta)
-            log_prob = None
+            log_prob = torch.zeros_like(alpha[..., 0])
         else:
             sample = dist.rsample()
             log_prob = dist.log_prob(sample).sum(-1)
+
+        terminate_prob = terminate_prob.clamp(self.eps, 1.0 - self.eps)
+        term_dist = torch.distributions.Bernoulli(probs=terminate_prob)
+        if deterministic:
+            terminate_action = terminate_prob > 0.5
+            terminate_log_prob = torch.zeros_like(terminate_prob)
+        else:
+            terminate_action = term_dist.sample().bool()
+            terminate_log_prob = term_dist.log_prob(terminate_action.float())
+
         action = (sample * 2 - 1) * MAX_ACC
         if agent_mask is not None:
             action = action.masked_fill(agent_mask.unsqueeze(-1), 0.0)
-            if log_prob is not None:
-                log_prob = log_prob.masked_fill(agent_mask, 0.0)
+            log_prob = log_prob.masked_fill(agent_mask, 0.0)
+            terminate_log_prob = terminate_log_prob.masked_fill(agent_mask, 0.0)
+            terminate_prob = terminate_prob.masked_fill(agent_mask, 0.0)
+            terminate_action = terminate_action.masked_fill(agent_mask, False)
+        return action, log_prob, terminate_action, terminate_log_prob, terminate_prob
+
+    def get_action(self, *args, **kwargs):
+        action, log_prob, _, _, _ = self.sample_policy(*args, **kwargs)
         return action, log_prob
 
-    def evaluate_action(self, ego, node_feat, adj, nbrs, nbr_mask, action, agent_mask=None, ep_start=False, training_mode=False):
-        alpha, beta = self.forward(
+    def evaluate_policy(
+        self,
+        ego,
+        node_feat,
+        adj,
+        nbrs,
+        nbr_mask,
+        action,
+        terminate_action,
+        subgoal_pos=None,
+        subgoal_token=None,
+        agent_mask=None,
+        option_start=None,
+        ep_start=False,
+        training_mode=False,
+    ):
+        alpha, beta, terminate_prob = self.forward(
             ego,
             node_feat,
             adj,
             nbrs,
             nbr_mask,
+            subgoal_pos=subgoal_pos,
+            subgoal_token=subgoal_token,
             agent_mask=agent_mask,
+            option_start=option_start,
             ep_start=ep_start,
             training_mode=training_mode,
         )
         dist = torch.distributions.Beta(alpha, beta)
         sample = (action / MAX_ACC + 1) / 2
         sample = sample.clamp(self.eps, 1 - self.eps)
-        log_prob = dist.log_prob(sample).sum(-1)
-        entropy = dist.entropy().sum(-1)
+        action_log_prob = dist.log_prob(sample).sum(-1)
+        action_entropy = dist.entropy().sum(-1)
+
+        terminate_prob = terminate_prob.clamp(self.eps, 1.0 - self.eps)
+        term_dist = torch.distributions.Bernoulli(probs=terminate_prob)
+        term_action = terminate_action.float()
+        term_log_prob = term_dist.log_prob(term_action)
+        term_entropy = term_dist.entropy()
         if agent_mask is not None:
-            log_prob = log_prob.masked_fill(agent_mask, 0.0)
-            entropy = entropy.masked_fill(agent_mask, 0.0)
-        return log_prob, entropy
+            action_log_prob = action_log_prob.masked_fill(agent_mask, 0.0)
+            action_entropy = action_entropy.masked_fill(agent_mask, 0.0)
+            term_log_prob = term_log_prob.masked_fill(agent_mask, 0.0)
+            term_entropy = term_entropy.masked_fill(agent_mask, 0.0)
+        return action_log_prob, action_entropy, term_log_prob, term_entropy
+
+    def evaluate_action(self, ego, node_feat, adj, nbrs, nbr_mask, action, agent_mask=None, ep_start=False, training_mode=False):
+        action_log_prob, action_entropy, _, _ = self.evaluate_policy(
+            ego,
+            node_feat,
+            adj,
+            nbrs,
+            nbr_mask,
+            action,
+            terminate_action=torch.zeros(action.shape[:-1], device=action.device),
+            agent_mask=agent_mask,
+            ep_start=ep_start,
+            training_mode=training_mode,
+        )
+        return action_log_prob, action_entropy
 
     def graph_attn_weights(self) -> Optional[np.ndarray]:
         attn = self.graph_encoder._last_attn

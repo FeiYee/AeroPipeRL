@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> None:
 
     def new_episode():
         obs = env.reset()
-        trainer.policy.executor.reset_temporal()
+        trainer.reset_episode()
         return obs, 0.0, 0
 
     def on_episode_end(ep_reward, results, ep_steps):
@@ -112,6 +112,7 @@ def main(argv: list[str] | None = None) -> None:
             eta_std = float(np.std(goal_steps)) if goal_steps else float("nan")
             speed_avg = env.ep_speed_sum / max(env.ep_speed_count, 1)
             lr_a = float(trainer.opt_exec.param_groups[0]["lr"])
+            lr_p = float(trainer.opt_planner.param_groups[0]["lr"])
             lr_c = float(trainer.opt_c.param_groups[0]["lr"])
 
             r100 = float(np.mean(list(trainer.r_hist)[-100:])) if trainer.r_hist else 0.0
@@ -137,7 +138,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             print(
                 f"           train: spd_alive={speed_avg:5.2f} loss20={loss20:8.4f} "
-                f"lr(a/c)={lr_a:.2e}/{lr_c:.2e} upd={trainer.update_cnt:6d} buf={len(trainer.buf):4d} best={trainer.best_score:8.2f}"
+                f"lr(a/p/c)={lr_a:.2e}/{lr_p:.2e}/{lr_c:.2e} upd={trainer.update_cnt:6d} buf={len(trainer.buf):4d} best={trainer.best_score:8.2f}"
             )
 
         tr_obs, tr_ep_r, tr_ep_steps = new_episode()
@@ -147,7 +148,8 @@ def main(argv: list[str] | None = None) -> None:
     while True:
         egos, node_feats, adjs, nbrs, nbr_masks, global_obs = tr_obs
         dones_before = env.dones.copy()
-        acts, log_probs, values, planner_next, planner_lp, planner_reward = trainer.act(
+        ep_start = tr_ep_steps == 0
+        step_out = trainer.act(
             egos,
             node_feats,
             adjs,
@@ -156,11 +158,15 @@ def main(argv: list[str] | None = None) -> None:
             global_obs,
             env,
             agent_mask=dones_before,
+            ep_start=ep_start,
         )
-        next_obs, rewards, dones, results = env.step(acts)
+        next_obs, rewards, dones, results = env.step(step_out["actions"])
 
         tr_ep_r += rewards.sum()
         tr_ep_steps += 1
+        trainer.after_step(dones)
+
+        option_end = np.logical_or(step_out["termination_actions"], dones)
 
         clean_global = trainer._critic_global_from_egos(egos, dones_mask=dones_before)
         trainer.buf.push(
@@ -170,17 +176,35 @@ def main(argv: list[str] | None = None) -> None:
             np.stack(nbrs),
             np.stack(nbr_masks),
             clean_global,
-            acts,
-            log_probs,
+            step_out["actions"],
+            step_out["action_log_probs"],
             rewards,
             dones,
             ~dones_before,
-            values,
-            wall_hits=env._step_wall_hit.copy(),
-            ep_start=(tr_ep_steps == 1),
-            planner_next_node=planner_next,
-            planner_log_prob=planner_lp,
-            planner_rewards=planner_reward,
+            step_out["step_values"],
+            step_out["option_values"],
+            step_out["planner_values"],
+            env._step_wall_hit.copy(),
+            ep_start,
+            step_out["subgoal_positions"],
+            step_out["subgoal_tokens"],
+            step_out["option_start"],
+            option_end,
+            step_out["termination_actions"],
+            step_out["termination_log_probs"],
+            step_out["termination_probs"],
+            step_out["termination_active_masks"],
+            step_out["planner_node_feats"],
+            step_out["planner_edge_feats"],
+            step_out["planner_adjs"],
+            step_out["planner_node_masks"],
+            step_out["planner_cur_nodes"],
+            step_out["planner_goal_nodes"],
+            step_out["planner_route_onehot"],
+            step_out["planner_actions"],
+            step_out["planner_log_probs"],
+            step_out["planner_rewards"],
+            step_out["planner_active_masks"],
         )
         tr_obs = next_obs
 
